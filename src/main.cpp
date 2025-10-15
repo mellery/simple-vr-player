@@ -7,6 +7,8 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
+#include <iomanip>
 
 // FFmpeg includes
 extern "C" {
@@ -465,6 +467,7 @@ public:
     bool initialize();
     bool loadVideo(const char* filename);
     void setSBSMode(bool enabled) { sbsMode = enabled; }
+    void setDebugMode(bool enabled) { debugMode = enabled; }
     void run();
     void shutdown();
 
@@ -501,6 +504,14 @@ private:
     std::vector<uint8_t> frameBuffer;
     bool videoLoaded = false;
     bool sbsMode = false;  // Side-by-side 3D mode
+    bool debugMode = false;  // Debug/performance mode
+
+    // Performance tracking
+    std::chrono::steady_clock::time_point lastFPSPrint;
+    uint64_t frameCount = 0;
+    double totalDecodeTime = 0.0;
+    double totalUploadTime = 0.0;
+    double totalRenderTime = 0.0;
 
     // Helper functions
     bool createXrInstance();
@@ -1019,6 +1030,8 @@ void SimpleVRPlayer::processEvents(bool* exitRequested, bool* sessionRunning) {
 }
 
 void SimpleVRPlayer::renderFrame() {
+    auto frameStartTime = std::chrono::steady_clock::now();
+
     // Wait for the next frame
     XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frameState{XR_TYPE_FRAME_STATE};
@@ -1032,13 +1045,24 @@ void SimpleVRPlayer::renderFrame() {
     std::vector<XrCompositionLayerBaseHeader*> layers;
     XrCompositionLayerProjection projectionLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 
+    double decodeTime = 0.0;
+    double uploadTime = 0.0;
+
     if (frameState.shouldRender) {
         // Decode next video frame if video is loaded
         if (videoLoaded) {
+            auto decodeStart = std::chrono::steady_clock::now();
+
             int width, height;
             if (videoDecoder.readFrame(frameBuffer.data(), &width, &height)) {
+                auto decodeEnd = std::chrono::steady_clock::now();
+                decodeTime = std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
+
                 // Upload new frame to GPU
+                auto uploadStart = std::chrono::steady_clock::now();
                 videoTexture.update(vkDevice, vkQueue, vkCommandPool, frameBuffer.data(), width, height);
+                auto uploadEnd = std::chrono::steady_clock::now();
+                uploadTime = std::chrono::duration<double, std::milli>(uploadEnd - uploadStart).count();
             } else {
                 // End of video - loop back to start (or could stop playback)
                 std::cout << "End of video reached, looping..." << std::endl;
@@ -1095,6 +1119,39 @@ void SimpleVRPlayer::renderFrame() {
     endInfo.layers = layers.data();
 
     xrEndFrame(xrSession, &endInfo);
+
+    // Performance tracking
+    auto frameEndTime = std::chrono::steady_clock::now();
+    double frameTime = std::chrono::duration<double, std::milli>(frameEndTime - frameStartTime).count();
+
+    if (debugMode) {
+        frameCount++;
+        totalDecodeTime += decodeTime;
+        totalUploadTime += uploadTime;
+        totalRenderTime += frameTime;
+
+        // Print stats every second
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - lastFPSPrint).count();
+        if (elapsed >= 1.0) {
+            double avgFPS = frameCount / elapsed;
+            double avgDecode = frameCount > 0 ? totalDecodeTime / frameCount : 0.0;
+            double avgUpload = frameCount > 0 ? totalUploadTime / frameCount : 0.0;
+            double avgFrame = frameCount > 0 ? totalRenderTime / frameCount : 0.0;
+
+            std::cout << "[PERF] FPS: " << std::fixed << std::setprecision(1) << avgFPS
+                      << " | Frame: " << std::setprecision(2) << avgFrame << "ms"
+                      << " | Decode: " << avgDecode << "ms"
+                      << " | Upload: " << avgUpload << "ms" << std::endl;
+
+            // Reset counters
+            lastFPSPrint = now;
+            frameCount = 0;
+            totalDecodeTime = 0.0;
+            totalUploadTime = 0.0;
+            totalRenderTime = 0.0;
+        }
+    }
 }
 
 bool SimpleVRPlayer::initialize() {
@@ -1154,6 +1211,9 @@ void SimpleVRPlayer::run() {
     bool exitRequested = false;
     bool sessionRunning = false;
 
+    // Initialize performance tracking
+    lastFPSPrint = std::chrono::steady_clock::now();
+
     while (!exitRequested) {
         processEvents(&exitRequested, &sessionRunning);
 
@@ -1198,11 +1258,15 @@ int main(int argc, char** argv) {
     // Parse command line arguments
     const char* videoFile = nullptr;
     bool sbsMode = false;
+    bool debugMode = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--sbs") == 0 || strcmp(argv[i], "-s") == 0) {
             sbsMode = true;
             std::cout << "Side-by-side 3D mode enabled" << std::endl;
+        } else if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-d") == 0) {
+            debugMode = true;
+            std::cout << "Debug/performance mode enabled" << std::endl;
         } else if (argv[i][0] != '-') {
             videoFile = argv[i];
         }
@@ -1221,6 +1285,11 @@ int main(int argc, char** argv) {
         player.setSBSMode(true);
     }
 
+    // Set debug mode if enabled
+    if (debugMode) {
+        player.setDebugMode(true);
+    }
+
     // Load video file if provided
     if (videoFile) {
         if (!player.loadVideo(videoFile)) {
@@ -1228,8 +1297,9 @@ int main(int argc, char** argv) {
         }
     } else {
         std::cout << "No video file specified, showing test pattern" << std::endl;
-        std::cout << "Usage: ./simple-vr-player [--sbs] <video_file.mp4>" << std::endl;
-        std::cout << "  --sbs, -s  Enable side-by-side 3D mode" << std::endl;
+        std::cout << "Usage: ./simple-vr-player [--sbs] [--debug] <video_file.mp4>" << std::endl;
+        std::cout << "  --sbs, -s    Enable side-by-side 3D mode" << std::endl;
+        std::cout << "  --debug, -d  Enable performance metrics (FPS, timing)" << std::endl;
         std::cout << std::endl;
     }
 

@@ -15,6 +15,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 }
 
@@ -37,7 +38,7 @@ public:
     ~VideoDecoder() { close(); }
 
     bool open(const char* filename);
-    bool readFrame(uint8_t* rgbBuffer, int* width, int* height);
+    bool readFrame(uint8_t* rgbaBuffer, int* width, int* height);  // Now outputs RGBA
     void close();
 
     int getWidth() const { return codecCtx ? codecCtx->width : 0; }
@@ -49,9 +50,12 @@ private:
     AVCodecContext* codecCtx = nullptr;
     AVFrame* frame = nullptr;
     AVFrame* frameRGB = nullptr;
+    AVFrame* swFrame = nullptr;  // Software frame for hw->sw transfer
     SwsContext* swsCtx = nullptr;
     AVPacket* packet = nullptr;
+    AVBufferRef* hwDeviceCtx = nullptr;  // Hardware device context
     int videoStreamIndex = -1;
+    bool useHardwareDecode = false;  // Track if hardware decode is active
 };
 
 bool VideoDecoder::open(const char* filename) {
@@ -86,11 +90,26 @@ bool VideoDecoder::open(const char* filename) {
     // Get codec parameters
     AVCodecParameters* codecParams = formatCtx->streams[videoStreamIndex]->codecpar;
 
-    // Find decoder
-    const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+    // Try hardware decoder first (h264_cuvid for NVIDIA)
+    const AVCodec* codec = nullptr;
+    if (codecParams->codec_id == AV_CODEC_ID_H264) {
+        codec = avcodec_find_decoder_by_name("h264_cuvid");
+        if (codec) {
+            std::cout << "Found h264_cuvid hardware decoder, attempting to use NVDEC" << std::endl;
+            useHardwareDecode = true;
+        } else {
+            std::cout << "h264_cuvid not available, falling back to software decode" << std::endl;
+        }
+    }
+
+    // Fallback to software decoder
     if (!codec) {
-        std::cerr << "ERROR: Unsupported codec" << std::endl;
-        return false;
+        codec = avcodec_find_decoder(codecParams->codec_id);
+        if (!codec) {
+            std::cerr << "ERROR: Unsupported codec" << std::endl;
+            return false;
+        }
+        useHardwareDecode = false;
     }
 
     // Allocate codec context
@@ -104,6 +123,24 @@ bool VideoDecoder::open(const char* filename) {
     if (avcodec_parameters_to_context(codecCtx, codecParams) < 0) {
         std::cerr << "ERROR: Could not copy codec parameters" << std::endl;
         return false;
+    }
+
+    // Set up hardware acceleration if using NVDEC
+    if (useHardwareDecode) {
+        int ret = av_hwdevice_ctx_create(&hwDeviceCtx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
+        if (ret < 0) {
+            std::cerr << "WARNING: Failed to create CUDA device context, falling back to software decode" << std::endl;
+            useHardwareDecode = false;
+
+            // Recreate codec context with software decoder
+            avcodec_free_context(&codecCtx);
+            codec = avcodec_find_decoder(codecParams->codec_id);
+            codecCtx = avcodec_alloc_context3(codec);
+            avcodec_parameters_to_context(codecCtx, codecParams);
+        } else {
+            codecCtx->hw_device_ctx = av_buffer_ref(hwDeviceCtx);
+            std::cout << "Hardware acceleration enabled (CUDA/NVDEC)" << std::endl;
+        }
     }
 
     // Open codec
@@ -122,15 +159,25 @@ bool VideoDecoder::open(const char* filename) {
         return false;
     }
 
+    // Allocate software frame for hardware decode transfer
+    if (useHardwareDecode) {
+        swFrame = av_frame_alloc();
+        if (!swFrame) {
+            std::cerr << "ERROR: Could not allocate software frame" << std::endl;
+            return false;
+        }
+    }
+
     std::cout << "Video opened successfully:" << std::endl;
     std::cout << "  Resolution: " << codecCtx->width << "x" << codecCtx->height << std::endl;
     std::cout << "  Codec: " << codec->name << std::endl;
+    std::cout << "  Decoder: " << (useHardwareDecode ? "NVDEC (hardware)" : "software") << std::endl;
     std::cout << "  Duration: " << getDuration() << " seconds" << std::endl;
 
     return true;
 }
 
-bool VideoDecoder::readFrame(uint8_t* rgbBuffer, int* width, int* height) {
+bool VideoDecoder::readFrame(uint8_t* rgbaBuffer, int* width, int* height) {
     while (av_read_frame(formatCtx, packet) >= 0) {
         if (packet->stream_index == videoStreamIndex) {
             // Send packet to decoder
@@ -150,11 +197,26 @@ bool VideoDecoder::readFrame(uint8_t* rgbBuffer, int* width, int* height) {
                 return false;
             }
 
+            // If hardware decode, transfer frame from GPU to CPU
+            AVFrame* sourceFrame = frame;
+            if (useHardwareDecode && frame->format == AV_PIX_FMT_CUDA) {
+                // Transfer hardware frame to software frame
+                swFrame->format = AV_PIX_FMT_NV12;  // CUDA typically outputs NV12
+                ret = av_hwframe_transfer_data(swFrame, frame, 0);
+                if (ret < 0) {
+                    std::cerr << "ERROR: Failed to transfer frame from GPU to CPU" << std::endl;
+                    av_packet_unref(packet);
+                    return false;
+                }
+                sourceFrame = swFrame;
+            }
+
             // Initialize swscale context if needed
             if (!swsCtx) {
                 swsCtx = sws_getContext(
-                    codecCtx->width, codecCtx->height, codecCtx->pix_fmt,
-                    codecCtx->width, codecCtx->height, AV_PIX_FMT_RGB24,
+                    codecCtx->width, codecCtx->height,
+                    (AVPixelFormat)sourceFrame->format,
+                    codecCtx->width, codecCtx->height, AV_PIX_FMT_RGBA,
                     SWS_BILINEAR, nullptr, nullptr, nullptr);
 
                 if (!swsCtx) {
@@ -164,11 +226,11 @@ bool VideoDecoder::readFrame(uint8_t* rgbBuffer, int* width, int* height) {
                 }
             }
 
-            // Convert frame to RGB
-            uint8_t* dest[4] = { rgbBuffer, nullptr, nullptr, nullptr };
-            int destLinesize[4] = { codecCtx->width * 3, 0, 0, 0 };
+            // Convert frame to RGBA
+            uint8_t* dest[4] = { rgbaBuffer, nullptr, nullptr, nullptr };
+            int destLinesize[4] = { codecCtx->width * 4, 0, 0, 0 };
 
-            sws_scale(swsCtx, frame->data, frame->linesize, 0, codecCtx->height,
+            sws_scale(swsCtx, sourceFrame->data, sourceFrame->linesize, 0, codecCtx->height,
                      dest, destLinesize);
 
             *width = codecCtx->width;
@@ -197,6 +259,10 @@ void VideoDecoder::close() {
         swsCtx = nullptr;
     }
 
+    if (swFrame) {
+        av_frame_free(&swFrame);
+    }
+
     if (frameRGB) {
         av_frame_free(&frameRGB);
     }
@@ -213,9 +279,15 @@ void VideoDecoder::close() {
         avcodec_free_context(&codecCtx);
     }
 
+    if (hwDeviceCtx) {
+        av_buffer_unref(&hwDeviceCtx);
+    }
+
     if (formatCtx) {
         avformat_close_input(&formatCtx);
     }
+
+    useHardwareDecode = false;
 }
 
 class DynamicTexture {
@@ -223,8 +295,9 @@ public:
     DynamicTexture() = default;
     ~DynamicTexture() { destroy(); }
 
-    bool create(VkDevice device, VkPhysicalDevice physicalDevice, uint32_t width, uint32_t height);
-    void update(VkDevice device, VkQueue queue, VkCommandPool cmdPool, const uint8_t* rgbData, uint32_t width, uint32_t height);
+    bool create(VkDevice device, VkPhysicalDevice physicalDevice, VkCommandPool cmdPool, uint32_t width, uint32_t height);
+    void update(VkDevice device, VkQueue queue, const uint8_t* rgbaData, uint32_t width, uint32_t height);  // Now expects RGBA
+    void waitForUpload(VkDevice device);  // Wait for async upload to complete
     void destroy();
 
     VkImage getImage() const { return image; }
@@ -241,6 +314,9 @@ private:
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
     size_t stagingBufferSize = 0;
+
+    VkFence uploadFence = VK_NULL_HANDLE;  // Fence for async uploads
+    VkCommandBuffer uploadCmdBuffer = VK_NULL_HANDLE;  // Pre-allocated command buffer for uploads
 
     uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties);
 };
@@ -259,7 +335,7 @@ uint32_t DynamicTexture::findMemoryType(VkPhysicalDevice physicalDevice, uint32_
     return 0;
 }
 
-bool DynamicTexture::create(VkDevice dev, VkPhysicalDevice physicalDevice, uint32_t width, uint32_t height) {
+bool DynamicTexture::create(VkDevice dev, VkPhysicalDevice physicalDevice, VkCommandPool cmdPool, uint32_t width, uint32_t height) {
     device = dev;
     size_t imageSize = width * height * 4;  // RGBA (4 bytes per pixel for better GPU support)
 
@@ -359,36 +435,48 @@ bool DynamicTexture::create(VkDevice dev, VkPhysicalDevice physicalDevice, uint3
         return false;
     }
 
+    // Create fence for async uploads
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;  // Start signaled
+
+    if (vkCreateFence(device, &fenceInfo, nullptr, &uploadFence) != VK_SUCCESS) {
+        std::cerr << "ERROR: Failed to create upload fence" << std::endl;
+        return false;
+    }
+
+    // Pre-allocate command buffer for uploads (avoids per-frame allocation)
+    VkCommandBufferAllocateInfo cmdAllocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cmdAllocInfo.commandPool = cmdPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+
+    if (vkAllocateCommandBuffers(device, &cmdAllocInfo, &uploadCmdBuffer) != VK_SUCCESS) {
+        std::cerr << "ERROR: Failed to allocate upload command buffer" << std::endl;
+        return false;
+    }
+
     return true;
 }
 
-void DynamicTexture::update(VkDevice device, VkQueue queue, VkCommandPool cmdPool, const uint8_t* rgbData, uint32_t width, uint32_t height) {
+void DynamicTexture::update(VkDevice device, VkQueue queue, const uint8_t* rgbaData, uint32_t width, uint32_t height) {
     size_t imageSize = width * height * 4;
 
-    // Convert RGB24 to RGBA32 and copy to staging buffer
+    // Direct RGBA copy to staging buffer (no conversion needed!)
     void* data;
     vkMapMemory(device, stagingMemory, 0, imageSize, 0, &data);
-    uint8_t* dst = static_cast<uint8_t*>(data);
-    for (uint32_t i = 0; i < width * height; i++) {
-        dst[i * 4 + 0] = rgbData[i * 3 + 0];  // R
-        dst[i * 4 + 1] = rgbData[i * 3 + 1];  // G
-        dst[i * 4 + 2] = rgbData[i * 3 + 2];  // B
-        dst[i * 4 + 3] = 255;                  // A (opaque)
-    }
+    memcpy(data, rgbaData, imageSize);  // Simple memcpy - much faster!
     vkUnmapMemory(device, stagingMemory);
 
-    // Create command buffer for copy
-    VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = cmdPool;
-    allocInfo.commandBufferCount = 1;
+    // Wait for previous upload to complete before resetting command buffer
+    vkWaitForFences(device, 1, &uploadFence, VK_TRUE, UINT64_MAX);
+    vkResetFences(device, 1, &uploadFence);
 
-    VkCommandBuffer cmdBuffer;
-    vkAllocateCommandBuffers(device, &allocInfo, &cmdBuffer);
+    // Reset and begin command buffer (reuse pre-allocated buffer)
+    vkResetCommandBuffer(uploadCmdBuffer, 0);
 
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+    vkBeginCommandBuffer(uploadCmdBuffer, &beginInfo);
 
     // Transition image to TRANSFER_DST_OPTIMAL
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -405,7 +493,7 @@ void DynamicTexture::update(VkDevice device, VkQueue queue, VkCommandPool cmdPoo
     barrier.srcAccessMask = 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
-    vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    vkCmdPipelineBarrier(uploadCmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
     // Copy buffer to image
@@ -420,7 +508,7 @@ void DynamicTexture::update(VkDevice device, VkQueue queue, VkCommandPool cmdPoo
     region.imageOffset = {0, 0, 0};
     region.imageExtent = {width, height, 1};
 
-    vkCmdCopyBufferToImage(cmdBuffer, stagingBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    vkCmdCopyBufferToImage(uploadCmdBuffer, stagingBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     // Transition image to SHADER_READ_ONLY_OPTIMAL
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -428,23 +516,40 @@ void DynamicTexture::update(VkDevice device, VkQueue queue, VkCommandPool cmdPoo
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-    vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    vkCmdPipelineBarrier(uploadCmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    vkEndCommandBuffer(cmdBuffer);
+    vkEndCommandBuffer(uploadCmdBuffer);
 
+    // Submit with fence (ASYNC - doesn't wait!)
     VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmdBuffer;
+    submitInfo.pCommandBuffers = &uploadCmdBuffer;
 
-    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
+    vkQueueSubmit(queue, 1, &submitInfo, uploadFence);  // Signal fence when done
 
-    vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuffer);
+    // DON'T wait here - let GPU work async!
+    // Command buffer will be reused next frame (no free needed!)
+}
+
+void DynamicTexture::waitForUpload(VkDevice device) {
+    // Wait for async upload to complete
+    if (uploadFence != VK_NULL_HANDLE) {
+        vkWaitForFences(device, 1, &uploadFence, VK_TRUE, UINT64_MAX);
+    }
 }
 
 void DynamicTexture::destroy() {
     if (device == VK_NULL_HANDLE) return;
+
+    // Wait for any pending uploads before destroying
+    if (uploadFence != VK_NULL_HANDLE) {
+        vkWaitForFences(device, 1, &uploadFence, VK_TRUE, UINT64_MAX);
+        vkDestroyFence(device, uploadFence, nullptr);
+    }
+
+    // Command buffer will be freed when command pool is destroyed
+    // (no manual free needed for pre-allocated buffer)
 
     if (sampler != VK_NULL_HANDLE) vkDestroySampler(device, sampler, nullptr);
     if (imageView != VK_NULL_HANDLE) vkDestroyImageView(device, imageView, nullptr);
@@ -460,6 +565,8 @@ void DynamicTexture::destroy() {
     sampler = VK_NULL_HANDLE;
     stagingBuffer = VK_NULL_HANDLE;
     stagingMemory = VK_NULL_HANDLE;
+    uploadFence = VK_NULL_HANDLE;
+    uploadCmdBuffer = VK_NULL_HANDLE;
 }
 
 class SimpleVRPlayer {
@@ -512,6 +619,8 @@ private:
     double totalDecodeTime = 0.0;
     double totalUploadTime = 0.0;
     double totalRenderTime = 0.0;
+    double totalRenderEyeTime = 0.0;  // NEW: Track renderEye time
+    double totalOpenXRTime = 0.0;     // NEW: Track OpenXR overhead
 
     // Helper functions
     bool createXrInstance();
@@ -861,6 +970,9 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, VkImage image, uint32_t width,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
     if (videoLoaded) {
+        // Wait for video texture upload to complete before using it
+        videoTexture.waitForUpload(vkDevice);
+
         // Transition source video texture to TRANSFER_SRC_OPTIMAL
         VkImageMemoryBarrier srcBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         srcBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1033,13 +1145,19 @@ void SimpleVRPlayer::renderFrame() {
     auto frameStartTime = std::chrono::steady_clock::now();
 
     // Wait for the next frame
+    auto waitFrameStart = std::chrono::steady_clock::now();
     XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frameState{XR_TYPE_FRAME_STATE};
     xrWaitFrame(xrSession, &waitInfo, &frameState);
+    auto waitFrameEnd = std::chrono::steady_clock::now();
+    double waitFrameTime = std::chrono::duration<double, std::milli>(waitFrameEnd - waitFrameStart).count();
 
     // Begin frame
+    auto beginFrameStart = std::chrono::steady_clock::now();
     XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
     xrBeginFrame(xrSession, &beginInfo);
+    auto beginFrameEnd = std::chrono::steady_clock::now();
+    double beginFrameTime = std::chrono::duration<double, std::milli>(beginFrameEnd - beginFrameStart).count();
 
     // Render layers (must be declared outside if block to stay in scope)
     std::vector<XrCompositionLayerBaseHeader*> layers;
@@ -1047,6 +1165,10 @@ void SimpleVRPlayer::renderFrame() {
 
     double decodeTime = 0.0;
     double uploadTime = 0.0;
+    double renderEyeTime = 0.0;
+    double locateViewsTime = 0.0;
+    double acquireSwapchainTime = 0.0;
+    double openxrTime = 0.0;
 
     if (frameState.shouldRender) {
         // Decode next video frame if video is loaded
@@ -1060,7 +1182,7 @@ void SimpleVRPlayer::renderFrame() {
 
                 // Upload new frame to GPU
                 auto uploadStart = std::chrono::steady_clock::now();
-                videoTexture.update(vkDevice, vkQueue, vkCommandPool, frameBuffer.data(), width, height);
+                videoTexture.update(vkDevice, vkQueue, frameBuffer.data(), width, height);
                 auto uploadEnd = std::chrono::steady_clock::now();
                 uploadTime = std::chrono::duration<double, std::milli>(uploadEnd - uploadStart).count();
             } else {
@@ -1072,6 +1194,7 @@ void SimpleVRPlayer::renderFrame() {
         }
 
         // Locate views
+        auto locateViewsStart = std::chrono::steady_clock::now();
         XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
         locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         locateInfo.displayTime = frameState.predictedDisplayTime;
@@ -1080,8 +1203,11 @@ void SimpleVRPlayer::renderFrame() {
         XrViewState viewState{XR_TYPE_VIEW_STATE};
         uint32_t viewCountOutput;
         xrLocateViews(xrSession, &locateInfo, &viewState, viewCount, &viewCountOutput, views.data());
+        auto locateViewsEnd = std::chrono::steady_clock::now();
+        locateViewsTime = std::chrono::duration<double, std::milli>(locateViewsEnd - locateViewsStart).count();
 
         // Acquire and render to each swapchain
+        auto acquireSwapchainStart = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < viewCount; i++) {
             uint32_t imageIndex;
             XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -1092,8 +1218,11 @@ void SimpleVRPlayer::renderFrame() {
             xrWaitSwapchainImage(xrSwapchains[i], &waitInfo);
 
             // Render to the swapchain image
+            auto renderEyeStart = std::chrono::steady_clock::now();  // NEW
             VkImage image = swapchainImages[i][imageIndex].image;
             renderEye(i, image, viewConfigs[i].recommendedImageRectWidth, viewConfigs[i].recommendedImageRectHeight);
+            auto renderEyeEnd = std::chrono::steady_clock::now();  // NEW
+            renderEyeTime += std::chrono::duration<double, std::milli>(renderEyeEnd - renderEyeStart).count();  // NEW
 
             XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             xrReleaseSwapchainImage(xrSwapchains[i], &releaseInfo);
@@ -1102,6 +1231,8 @@ void SimpleVRPlayer::renderFrame() {
             projectionViews[i].pose = views[i].pose;
             projectionViews[i].fov = views[i].fov;
         }
+        auto acquireSwapchainEnd = std::chrono::steady_clock::now();
+        acquireSwapchainTime = std::chrono::duration<double, std::milli>(acquireSwapchainEnd - acquireSwapchainStart).count() - renderEyeTime;
 
         // Set up projection layer
         projectionLayer.space = xrPlaySpace;
@@ -1112,6 +1243,7 @@ void SimpleVRPlayer::renderFrame() {
     }
 
     // End frame
+    auto endFrameStart = std::chrono::steady_clock::now();
     XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
     endInfo.displayTime = frameState.predictedDisplayTime;
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1119,6 +1251,11 @@ void SimpleVRPlayer::renderFrame() {
     endInfo.layers = layers.data();
 
     xrEndFrame(xrSession, &endInfo);
+    auto endFrameEnd = std::chrono::steady_clock::now();
+    double endFrameTime = std::chrono::duration<double, std::milli>(endFrameEnd - endFrameStart).count();
+
+    // Calculate total OpenXR time from detailed components
+    openxrTime = waitFrameTime + beginFrameTime + locateViewsTime + acquireSwapchainTime + endFrameTime;
 
     // Performance tracking
     auto frameEndTime = std::chrono::steady_clock::now();
@@ -1129,6 +1266,8 @@ void SimpleVRPlayer::renderFrame() {
         totalDecodeTime += decodeTime;
         totalUploadTime += uploadTime;
         totalRenderTime += frameTime;
+        totalRenderEyeTime += renderEyeTime;  // NEW
+        totalOpenXRTime += openxrTime;         // NEW
 
         // Print stats every second
         auto now = std::chrono::steady_clock::now();
@@ -1138,11 +1277,23 @@ void SimpleVRPlayer::renderFrame() {
             double avgDecode = frameCount > 0 ? totalDecodeTime / frameCount : 0.0;
             double avgUpload = frameCount > 0 ? totalUploadTime / frameCount : 0.0;
             double avgFrame = frameCount > 0 ? totalRenderTime / frameCount : 0.0;
+            double avgRenderEye = frameCount > 0 ? totalRenderEyeTime / frameCount : 0.0;  // NEW
+            double avgOpenXR = frameCount > 0 ? totalOpenXRTime / frameCount : 0.0;  // NEW
 
+            // Print comprehensive timing breakdown
             std::cout << "[PERF] FPS: " << std::fixed << std::setprecision(1) << avgFPS
-                      << " | Frame: " << std::setprecision(2) << avgFrame << "ms"
-                      << " | Decode: " << avgDecode << "ms"
-                      << " | Upload: " << avgUpload << "ms" << std::endl;
+                      << " | Frame: " << std::setprecision(2) << avgFrame << "ms" << std::endl;
+            std::cout << "       Decode: " << avgDecode << "ms"
+                      << " | Upload: " << avgUpload << "ms"
+                      << " | RenderEye: " << avgRenderEye << "ms"
+                      << " | OpenXR: " << avgOpenXR << "ms" << std::endl;
+
+            // Calculate and print detailed OpenXR breakdown (these are single-frame samples, not averages)
+            std::cout << "       [OpenXR] WaitFrame: " << waitFrameTime << "ms"
+                      << " | BeginFrame: " << beginFrameTime << "ms"
+                      << " | LocateViews: " << locateViewsTime << "ms" << std::endl;
+            std::cout << "       [OpenXR] AcquireSwap: " << acquireSwapchainTime << "ms"
+                      << " | EndFrame: " << endFrameTime << "ms" << std::endl;
 
             // Reset counters
             lastFPSPrint = now;
@@ -1150,6 +1301,8 @@ void SimpleVRPlayer::renderFrame() {
             totalDecodeTime = 0.0;
             totalUploadTime = 0.0;
             totalRenderTime = 0.0;
+            totalRenderEyeTime = 0.0;  // NEW
+            totalOpenXRTime = 0.0;     // NEW
         }
     }
 }
@@ -1181,18 +1334,18 @@ bool SimpleVRPlayer::loadVideo(const char* filename) {
     int videoWidth = videoDecoder.getWidth();
     int videoHeight = videoDecoder.getHeight();
 
-    if (!videoTexture.create(vkDevice, vkPhysicalDevice, videoWidth, videoHeight)) {
+    if (!videoTexture.create(vkDevice, vkPhysicalDevice, vkCommandPool, videoWidth, videoHeight)) {
         std::cerr << "ERROR: Failed to create video texture" << std::endl;
         return false;
     }
 
     // Allocate frame buffer for decoded frames
-    frameBuffer.resize(videoWidth * videoHeight * 3);  // RGB24
+    frameBuffer.resize(videoWidth * videoHeight * 4);  // RGBA32
 
     // Decode and upload first frame
     int width, height;
     if (videoDecoder.readFrame(frameBuffer.data(), &width, &height)) {
-        videoTexture.update(vkDevice, vkQueue, vkCommandPool, frameBuffer.data(), width, height);
+        videoTexture.update(vkDevice, vkQueue, frameBuffer.data(), width, height);
         std::cout << "First frame loaded and uploaded to GPU" << std::endl;
     } else {
         std::cerr << "ERROR: Failed to decode first frame" << std::endl;

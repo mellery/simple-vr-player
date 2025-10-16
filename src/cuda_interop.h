@@ -36,6 +36,7 @@ struct VulkanCudaInterop {
     VkDeviceMemory imageMemory;
     VkImage image;
     VkImageView imageView;
+    VkSampler sampler;
     uint32_t width;
     uint32_t height;
 

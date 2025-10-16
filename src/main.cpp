@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <chrono>
 #include <iomanip>
+#include <fstream>
+#include <cmath>
 
 // FFmpeg includes
 extern "C" {
@@ -21,6 +23,9 @@ extern "C" {
 
 // CUDA interop
 #include "cuda_interop.h"
+
+// Math utilities for 3D rendering
+#include "math_utils.h"
 
 // Helper macro for OpenXR error checking
 #define XR_CHECK(result, msg) \
@@ -610,10 +615,18 @@ void DynamicTexture::destroy() {
 
 class SimpleVRPlayer {
 public:
+    // Rendering mode enum
+    enum VideoMode {
+        MODE_FLAT,      // Flat quad (default)
+        MODE_SPHERE_180, // 180° hemisphere
+        MODE_SPHERE_360  // 360° full sphere
+    };
+
     bool initialize();
     bool loadVideo(const char* filename);
     void setSBSMode(bool enabled) { sbsMode = enabled; }
     void setDebugMode(bool enabled) { debugMode = enabled; }
+    void setVideoMode(VideoMode mode) { videoMode = mode; }
     void run();
     void shutdown();
 
@@ -644,6 +657,25 @@ private:
     VkCommandPool vkCommandPool = VK_NULL_HANDLE;
     VkFormat swapchainFormat = VK_FORMAT_UNDEFINED;
 
+    // Graphics pipeline resources for 3D rendering
+    VkRenderPass vkRenderPass = VK_NULL_HANDLE;
+    VkPipelineLayout vkPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline vkGraphicsPipeline = VK_NULL_HANDLE;
+    VkDescriptorSetLayout vkDescriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool vkDescriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet vkDescriptorSet = VK_NULL_HANDLE;
+
+    // Quad geometry
+    VkBuffer vkVertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory vkVertexBufferMemory = VK_NULL_HANDLE;
+    VkBuffer vkIndexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory vkIndexBufferMemory = VK_NULL_HANDLE;
+    uint32_t indexCount = 0;
+
+    // Framebuffers and image views (one per eye per swapchain image)
+    std::vector<std::vector<VkImageView>> vkSwapchainImageViews;  // [eyeIndex][imageIndex]
+    std::vector<std::vector<VkFramebuffer>> vkFramebuffers;  // [eyeIndex][imageIndex]
+
     // Video playback resources
     VideoDecoder videoDecoder;
     VulkanCudaInterop cudaInterop = {};
@@ -651,6 +683,7 @@ private:
     bool videoLoaded = false;
     bool sbsMode = false;  // Side-by-side 3D mode
     bool debugMode = false;  // Debug/performance mode
+    VideoMode videoMode = MODE_FLAT;
 
     // Performance tracking
     std::chrono::steady_clock::time_point lastFPSPrint;
@@ -670,7 +703,22 @@ private:
     bool createXrSpace();
     bool createSwapchains();
     bool createRenderingResources();
-    void renderEye(uint32_t eyeIndex, VkImage image, uint32_t width, uint32_t height);
+
+    // 3D rendering helpers
+    std::vector<char> loadShaderFile(const char* filename);
+    VkShaderModule createShaderModule(const std::vector<char>& code);
+    bool createRenderPass();
+    bool createGraphicsPipeline();
+    bool createDescriptorSetLayout();
+    bool createDescriptorPool();
+    bool createDescriptorSet();
+    void updateDescriptorSet();  // Update descriptor to point to video texture
+    bool createQuadGeometry();
+    bool createSphereGeometry(int segments, float radius, float angleHorizontal, float angleVertical);
+    bool createFramebuffers();
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
+
+    void renderEye(uint32_t eyeIndex, uint32_t imageIndex, VkImage image, uint32_t width, uint32_t height);
     void processEvents(bool* exitRequested, bool* sessionRunning);
     void renderFrame();
 };
@@ -958,6 +1006,526 @@ bool SimpleVRPlayer::createSwapchains() {
     return true;
 }
 
+// Helper function to load compiled SPIR-V shader from file
+std::vector<char> SimpleVRPlayer::loadShaderFile(const char* filename) {
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+
+    if (!file.is_open()) {
+        std::cerr << "ERROR: Failed to open shader file: " << filename << std::endl;
+        return {};
+    }
+
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> buffer(fileSize);
+
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+    file.close();
+
+    return buffer;
+}
+
+VkShaderModule SimpleVRPlayer::createShaderModule(const std::vector<char>& code) {
+    VkShaderModuleCreateInfo createInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    createInfo.codeSize = code.size();
+    createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+    VkShaderModule shaderModule;
+    if (vkCreateShaderModule(vkDevice, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+        std::cerr << "ERROR: Failed to create shader module" << std::endl;
+        return VK_NULL_HANDLE;
+    }
+
+    return shaderModule;
+}
+
+uint32_t SimpleVRPlayer::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(vkPhysicalDevice, &memProperties);
+
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+
+    std::cerr << "ERROR: Failed to find suitable memory type" << std::endl;
+    return 0;
+}
+
+bool SimpleVRPlayer::createRenderPass() {
+    VkAttachmentDescription colorAttachment{};
+    colorAttachment.format = swapchainFormat;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorAttachmentRef{};
+    colorAttachmentRef.attachment = 0;
+    colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorAttachmentRef;
+
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.srcAccessMask = 0;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    renderPassInfo.attachmentCount = 1;
+    renderPassInfo.pAttachments = &colorAttachment;
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    renderPassInfo.dependencyCount = 1;
+    renderPassInfo.pDependencies = &dependency;
+
+    VkResult result = vkCreateRenderPass(vkDevice, &renderPassInfo, nullptr, &vkRenderPass);
+    VK_CHECK(result, "Failed to create render pass");
+
+    return true;
+}
+
+bool SimpleVRPlayer::createDescriptorSetLayout() {
+    VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+    samplerLayoutBinding.binding = 0;
+    samplerLayoutBinding.descriptorCount = 1;
+    samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    samplerLayoutBinding.pImmutableSamplers = nullptr;
+    samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &samplerLayoutBinding;
+
+    VkResult result = vkCreateDescriptorSetLayout(vkDevice, &layoutInfo, nullptr, &vkDescriptorSetLayout);
+    VK_CHECK(result, "Failed to create descriptor set layout");
+
+    return true;
+}
+
+bool SimpleVRPlayer::createGraphicsPipeline() {
+    // Load shaders
+    auto vertShaderCode = loadShaderFile("../shaders/quad.vert.spv");
+    auto fragShaderCode = loadShaderFile("../shaders/quad.frag.spv");
+
+    if (vertShaderCode.empty() || fragShaderCode.empty()) {
+        std::cerr << "ERROR: Failed to load shader files" << std::endl;
+        return false;
+    }
+
+    VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
+    VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
+
+    if (vertShaderModule == VK_NULL_HANDLE || fragShaderModule == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo vertShaderStageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    vertShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertShaderStageInfo.module = vertShaderModule;
+    vertShaderStageInfo.pName = "main";
+
+    VkPipelineShaderStageCreateInfo fragShaderStageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    fragShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragShaderStageInfo.module = fragShaderModule;
+    fragShaderStageInfo.pName = "main";
+
+    VkPipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
+
+    // Vertex input
+    VkVertexInputBindingDescription bindingDescription{};
+    bindingDescription.binding = 0;
+    bindingDescription.stride = sizeof(float) * 5;  // 3 floats for position, 2 for UV
+    bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attributeDescriptions[2] = {};
+    // Position
+    attributeDescriptions[0].binding = 0;
+    attributeDescriptions[0].location = 0;
+    attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributeDescriptions[0].offset = 0;
+    // TexCoord
+    attributeDescriptions[1].binding = 0;
+    attributeDescriptions[1].location = 1;
+    attributeDescriptions[1].format = VK_FORMAT_R32G32_SFLOAT;
+    attributeDescriptions[1].offset = sizeof(float) * 3;
+
+    VkPipelineVertexInputStateCreateInfo vertexInputInfo{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vertexInputInfo.vertexBindingDescriptionCount = 1;
+    vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+    vertexInputInfo.vertexAttributeDescriptionCount = 2;
+    vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions;
+
+    // Input assembly
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+    // Viewport and scissor (dynamic)
+    VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    // Rasterizer
+    VkPipelineRasterizationStateCreateInfo rasterizer{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rasterizer.depthClampEnable = VK_FALSE;
+    rasterizer.rasterizerDiscardEnable = VK_FALSE;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.depthBiasEnable = VK_FALSE;
+
+    // Multisampling
+    VkPipelineMultisampleStateCreateInfo multisampling{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisampling.sampleShadingEnable = VK_FALSE;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // Color blending
+    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    colorBlendAttachment.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo colorBlending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    colorBlending.logicOpEnable = VK_FALSE;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &colorBlendAttachment;
+
+    // Dynamic state
+    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates = dynamicStates;
+
+    // Push constants for MVP matrix + UV offset/scale
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = sizeof(float) * 16 + sizeof(float) * 4;  // mat4 (64 bytes) + vec2 + vec2 (16 bytes) = 80 bytes
+
+    // Pipeline layout
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &vkDescriptorSetLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+
+    VkResult result = vkCreatePipelineLayout(vkDevice, &pipelineLayoutInfo, nullptr, &vkPipelineLayout);
+    VK_CHECK(result, "Failed to create pipeline layout");
+
+    // Graphics pipeline
+    VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = shaderStages;
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = vkPipelineLayout;
+    pipelineInfo.renderPass = vkRenderPass;
+    pipelineInfo.subpass = 0;
+
+    result = vkCreateGraphicsPipelines(vkDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vkGraphicsPipeline);
+    VK_CHECK(result, "Failed to create graphics pipeline");
+
+    // Cleanup shader modules
+    vkDestroyShaderModule(vkDevice, fragShaderModule, nullptr);
+    vkDestroyShaderModule(vkDevice, vertShaderModule, nullptr);
+
+    return true;
+}
+
+bool SimpleVRPlayer::createDescriptorPool() {
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSize.descriptorCount = 1;
+
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = 1;
+
+    VkResult result = vkCreateDescriptorPool(vkDevice, &poolInfo, nullptr, &vkDescriptorPool);
+    VK_CHECK(result, "Failed to create descriptor pool");
+
+    return true;
+}
+
+bool SimpleVRPlayer::createDescriptorSet() {
+    VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocInfo.descriptorPool = vkDescriptorPool;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &vkDescriptorSetLayout;
+
+    VkResult result = vkAllocateDescriptorSets(vkDevice, &allocInfo, &vkDescriptorSet);
+    VK_CHECK(result, "Failed to allocate descriptor set");
+
+    return true;
+}
+
+bool SimpleVRPlayer::createQuadGeometry() {
+    // Quad vertices: position (x, y, z) and UV coordinates (u, v)
+    // Position the quad 2 meters in front of the viewer, 2 meters wide and tall
+    float quadVertices[] = {
+        // Positions (X, Y, Z)     // UVs (U, V)
+        -1.0f, -1.0f, -2.0f,       0.0f, 1.0f,  // Bottom-left
+         1.0f, -1.0f, -2.0f,       1.0f, 1.0f,  // Bottom-right
+         1.0f,  1.0f, -2.0f,       1.0f, 0.0f,  // Top-right
+        -1.0f,  1.0f, -2.0f,       0.0f, 0.0f   // Top-left
+    };
+
+    uint16_t quadIndices[] = {
+        0, 1, 2,  // First triangle
+        2, 3, 0   // Second triangle
+    };
+
+    indexCount = 6;
+
+    // Create vertex buffer
+    VkDeviceSize bufferSize = sizeof(quadVertices);
+
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.size = bufferSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkResult result = vkCreateBuffer(vkDevice, &bufferInfo, nullptr, &vkVertexBuffer);
+    VK_CHECK(result, "Failed to create vertex buffer");
+
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(vkDevice, vkVertexBuffer, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    result = vkAllocateMemory(vkDevice, &allocInfo, nullptr, &vkVertexBufferMemory);
+    VK_CHECK(result, "Failed to allocate vertex buffer memory");
+
+    vkBindBufferMemory(vkDevice, vkVertexBuffer, vkVertexBufferMemory, 0);
+
+    void* data;
+    vkMapMemory(vkDevice, vkVertexBufferMemory, 0, bufferSize, 0, &data);
+    memcpy(data, quadVertices, (size_t)bufferSize);
+    vkUnmapMemory(vkDevice, vkVertexBufferMemory);
+
+    // Create index buffer
+    bufferSize = sizeof(quadIndices);
+
+    bufferInfo.size = bufferSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+
+    result = vkCreateBuffer(vkDevice, &bufferInfo, nullptr, &vkIndexBuffer);
+    VK_CHECK(result, "Failed to create index buffer");
+
+    vkGetBufferMemoryRequirements(vkDevice, vkIndexBuffer, &memRequirements);
+
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    result = vkAllocateMemory(vkDevice, &allocInfo, nullptr, &vkIndexBufferMemory);
+    VK_CHECK(result, "Failed to allocate index buffer memory");
+
+    vkBindBufferMemory(vkDevice, vkIndexBuffer, vkIndexBufferMemory, 0);
+
+    vkMapMemory(vkDevice, vkIndexBufferMemory, 0, bufferSize, 0, &data);
+    memcpy(data, quadIndices, (size_t)bufferSize);
+    vkUnmapMemory(vkDevice, vkIndexBufferMemory);
+
+    return true;
+}
+
+bool SimpleVRPlayer::createSphereGeometry(int segments, float radius, float angleHorizontal, float angleVertical) {
+    std::vector<float> vertices;
+    std::vector<uint16_t> indices;
+
+    // Generate sphere vertices
+    for (int lat = 0; lat <= segments; lat++) {
+        float theta = (float)lat / segments * angleVertical;
+        float sinTheta = sin(theta);
+        float cosTheta = cos(theta);
+
+        for (int lon = 0; lon <= segments; lon++) {
+            float phi = (float)lon / segments * angleHorizontal;
+            float sinPhi = sin(phi);
+            float cosPhi = cos(phi);
+
+            // Position (X, Y, Z)
+            float x = radius * sinTheta * cosPhi;
+            float y = radius * cosTheta;
+            float z = radius * sinTheta * sinPhi;
+
+            // UV coordinates
+            float u = (float)lon / segments;
+            float v = (float)lat / segments;
+
+            vertices.push_back(x);
+            vertices.push_back(y);
+            vertices.push_back(z);
+            vertices.push_back(u);
+            vertices.push_back(v);
+        }
+    }
+
+    // Generate sphere indices
+    for (int lat = 0; lat < segments; lat++) {
+        for (int lon = 0; lon < segments; lon++) {
+            int first = lat * (segments + 1) + lon;
+            int second = first + segments + 1;
+
+            indices.push_back(first);
+            indices.push_back(second);
+            indices.push_back(first + 1);
+
+            indices.push_back(second);
+            indices.push_back(second + 1);
+            indices.push_back(first + 1);
+        }
+    }
+
+    indexCount = indices.size();
+
+    // Create vertex buffer
+    VkDeviceSize vertexBufferSize = vertices.size() * sizeof(float);
+
+    VkBufferCreateInfo vertexBufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    vertexBufferInfo.size = vertexBufferSize;
+    vertexBufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    vertexBufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkResult result = vkCreateBuffer(vkDevice, &vertexBufferInfo, nullptr, &vkVertexBuffer);
+    VK_CHECK(result, "Failed to create vertex buffer");
+
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(vkDevice, vkVertexBuffer, &memRequirements);
+
+    VkMemoryAllocateInfo vertexAllocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    vertexAllocInfo.allocationSize = memRequirements.size;
+    vertexAllocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    result = vkAllocateMemory(vkDevice, &vertexAllocInfo, nullptr, &vkVertexBufferMemory);
+    VK_CHECK(result, "Failed to allocate vertex buffer memory");
+
+    vkBindBufferMemory(vkDevice, vkVertexBuffer, vkVertexBufferMemory, 0);
+
+    void* data;
+    vkMapMemory(vkDevice, vkVertexBufferMemory, 0, vertexBufferSize, 0, &data);
+    memcpy(data, vertices.data(), (size_t)vertexBufferSize);
+    vkUnmapMemory(vkDevice, vkVertexBufferMemory);
+
+    // Create index buffer
+    VkDeviceSize indexBufferSize = indices.size() * sizeof(uint16_t);
+
+    VkBufferCreateInfo indexBufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    indexBufferInfo.size = indexBufferSize;
+    indexBufferInfo.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    indexBufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    result = vkCreateBuffer(vkDevice, &indexBufferInfo, nullptr, &vkIndexBuffer);
+    VK_CHECK(result, "Failed to create index buffer");
+
+    vkGetBufferMemoryRequirements(vkDevice, vkIndexBuffer, &memRequirements);
+
+    VkMemoryAllocateInfo indexAllocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    indexAllocInfo.allocationSize = memRequirements.size;
+    indexAllocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    result = vkAllocateMemory(vkDevice, &indexAllocInfo, nullptr, &vkIndexBufferMemory);
+    VK_CHECK(result, "Failed to allocate index buffer memory");
+
+    vkBindBufferMemory(vkDevice, vkIndexBuffer, vkIndexBufferMemory, 0);
+
+    vkMapMemory(vkDevice, vkIndexBufferMemory, 0, indexBufferSize, 0, &data);
+    memcpy(data, indices.data(), (size_t)indexBufferSize);
+    vkUnmapMemory(vkDevice, vkIndexBufferMemory);
+
+    return true;
+}
+
+void SimpleVRPlayer::updateDescriptorSet() {
+    // Update descriptor set to bind the video texture from CUDA interop
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfo.imageView = cudaInterop.imageView;
+    imageInfo.sampler = cudaInterop.sampler;
+
+    VkWriteDescriptorSet descriptorWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    descriptorWrite.dstSet = vkDescriptorSet;
+    descriptorWrite.dstBinding = 0;
+    descriptorWrite.dstArrayElement = 0;
+    descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptorWrite.descriptorCount = 1;
+    descriptorWrite.pImageInfo = &imageInfo;
+
+    vkUpdateDescriptorSets(vkDevice, 1, &descriptorWrite, 0, nullptr);
+}
+
+bool SimpleVRPlayer::createFramebuffers() {
+    std::cout << "Creating framebuffers..." << std::endl;
+
+    vkSwapchainImageViews.resize(viewCount);
+    vkFramebuffers.resize(viewCount);
+
+    for (uint32_t eyeIndex = 0; eyeIndex < viewCount; eyeIndex++) {
+        uint32_t imageCount = swapchainLengths[eyeIndex];
+        vkSwapchainImageViews[eyeIndex].resize(imageCount);
+        vkFramebuffers[eyeIndex].resize(imageCount);
+
+        for (uint32_t i = 0; i < imageCount; i++) {
+            // Create image view for swapchain image
+            VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            viewInfo.image = swapchainImages[eyeIndex][i].image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = swapchainFormat;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.baseMipLevel = 0;
+            viewInfo.subresourceRange.levelCount = 1;
+            viewInfo.subresourceRange.baseArrayLayer = 0;
+            viewInfo.subresourceRange.layerCount = 1;
+
+            VkResult result = vkCreateImageView(vkDevice, &viewInfo, nullptr, &vkSwapchainImageViews[eyeIndex][i]);
+            VK_CHECK(result, "Failed to create swapchain image view");
+
+            // Create framebuffer
+            VkImageView attachments[] = {
+                vkSwapchainImageViews[eyeIndex][i]
+            };
+
+            VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            framebufferInfo.renderPass = vkRenderPass;
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = attachments;
+            framebufferInfo.width = viewConfigs[eyeIndex].recommendedImageRectWidth;
+            framebufferInfo.height = viewConfigs[eyeIndex].recommendedImageRectHeight;
+            framebufferInfo.layers = 1;
+
+            result = vkCreateFramebuffer(vkDevice, &framebufferInfo, nullptr, &vkFramebuffers[eyeIndex][i]);
+            VK_CHECK(result, "Failed to create framebuffer");
+        }
+    }
+
+    std::cout << "Framebuffers created successfully" << std::endl;
+    return true;
+}
+
 bool SimpleVRPlayer::createRenderingResources() {
     std::cout << "Creating rendering resources..." << std::endl;
 
@@ -969,11 +1537,31 @@ bool SimpleVRPlayer::createRenderingResources() {
     VkResult result = vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &vkCommandPool);
     VK_CHECK(result, "Failed to create command pool");
 
+    // Create rendering pipeline
+    if (!createDescriptorSetLayout()) return false;
+    if (!createRenderPass()) return false;
+    if (!createGraphicsPipeline()) return false;
+    if (!createDescriptorPool()) return false;
+    if (!createDescriptorSet()) return false;
+
+    // Create geometry based on video mode
+    if (videoMode == MODE_FLAT) {
+        if (!createQuadGeometry()) return false;
+    } else if (videoMode == MODE_SPHERE_180) {
+        // 180° hemisphere: 64 segments, 10m radius, 180° horizontal, 180° vertical
+        if (!createSphereGeometry(64, 10.0f, M_PI, M_PI)) return false;
+    } else if (videoMode == MODE_SPHERE_360) {
+        // 360° full sphere: 64 segments, 10m radius, 360° horizontal, 180° vertical
+        if (!createSphereGeometry(64, 10.0f, 2.0f * M_PI, M_PI)) return false;
+    }
+
+    if (!createFramebuffers()) return false;
+
     std::cout << "Rendering resources created successfully" << std::endl;
     return true;
 }
 
-void SimpleVRPlayer::renderEye(uint32_t eyeIndex, VkImage image, uint32_t width, uint32_t height) {
+void SimpleVRPlayer::renderEye(uint32_t eyeIndex, uint32_t imageIndex, VkImage image, uint32_t width, uint32_t height) {
     // Allocate command buffer
     VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = vkCommandPool;
@@ -988,32 +1576,11 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, VkImage image, uint32_t width,
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmdBuffer, &beginInfo);
 
-    // Transition destination image to TRANSFER_DST_OPTIMAL
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-    vkCmdPipelineBarrier(cmdBuffer,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
-
     if (videoLoaded) {
-        // Transition source video texture to TRANSFER_SRC_OPTIMAL
-        // CUDA interop image is ready to use (conversion is synchronous)
+        // Transition video texture to SHADER_READ_ONLY_OPTIMAL
         VkImageMemoryBarrier srcBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        srcBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        srcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        srcBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        srcBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         srcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         srcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         srcBarrier.image = cudaInterop.image;
@@ -1022,102 +1589,153 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, VkImage image, uint32_t width,
         srcBarrier.subresourceRange.levelCount = 1;
         srcBarrier.subresourceRange.baseArrayLayer = 0;
         srcBarrier.subresourceRange.layerCount = 1;
-        srcBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        srcBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        srcBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        srcBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
         vkCmdPipelineBarrier(cmdBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &srcBarrier);
 
-        // Blit video texture to swapchain image (scales automatically)
-        VkImageBlit blitRegion{};
-        blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        blitRegion.srcSubresource.mipLevel = 0;
-        blitRegion.srcSubresource.baseArrayLayer = 0;
-        blitRegion.srcSubresource.layerCount = 1;
+        // Begin render pass
+        VkRenderPassBeginInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        renderPassInfo.renderPass = vkRenderPass;
+        renderPassInfo.framebuffer = vkFramebuffers[eyeIndex][imageIndex];
+        renderPassInfo.renderArea.offset = {0, 0};
+        renderPassInfo.renderArea.extent = {width, height};
 
-        // Set source region based on SBS mode
-        if (sbsMode) {
-            // Side-by-side mode: use left half for left eye, right half for right eye
-            int32_t videoWidth = videoDecoder.getWidth();
-            int32_t videoHeight = videoDecoder.getHeight();
-            int32_t halfWidth = videoWidth / 2;
+        VkClearValue clearValue{};
+        clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        renderPassInfo.clearValueCount = 1;
+        renderPassInfo.pClearValues = &clearValue;
 
-            if (eyeIndex == 0) {
-                // Left eye: left half of video
-                blitRegion.srcOffsets[0] = {0, 0, 0};
-                blitRegion.srcOffsets[1] = {halfWidth, videoHeight, 1};
-            } else {
-                // Right eye: right half of video
-                blitRegion.srcOffsets[0] = {halfWidth, 0, 0};
-                blitRegion.srcOffsets[1] = {videoWidth, videoHeight, 1};
-            }
+        vkCmdBeginRenderPass(cmdBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+        // Bind graphics pipeline
+        vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkGraphicsPipeline);
+
+        // Bind descriptor set (video texture)
+        vkCmdBindDescriptorSets(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkPipelineLayout,
+            0, 1, &vkDescriptorSet, 0, nullptr);
+
+        // Set viewport and scissor
+        VkViewport viewport{};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = (float)width;
+        viewport.height = (float)height;
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(cmdBuffer, 0, 1, &viewport);
+
+        VkRect2D scissor{};
+        scissor.offset = {0, 0};
+        scissor.extent = {width, height};
+        vkCmdSetScissor(cmdBuffer, 0, 1, &scissor);
+
+        // Compute MVP matrix from OpenXR view and projection
+        using namespace MathUtils;
+        Matrix4x4 projection = Matrix4x4::CreateProjectionFov(views[eyeIndex].fov, 0.1f, 100.0f);
+        Matrix4x4 view = Matrix4x4::CreateViewMatrix(views[eyeIndex].pose);
+        Matrix4x4 model = Matrix4x4::Identity();
+
+        // For sphere mode, sphere is centered at viewer position (origin in view space)
+        // The view matrix already handles the head rotation, no translation needed
+        if (videoMode == MODE_SPHERE_180 || videoMode == MODE_SPHERE_360) {
+            // Sphere is centered at origin - no model transformation needed
+            model = Matrix4x4::Identity();
         } else {
-            // Mono mode: use full video for both eyes
-            blitRegion.srcOffsets[0] = {0, 0, 0};
-            blitRegion.srcOffsets[1] = {(int32_t)videoDecoder.getWidth(), (int32_t)videoDecoder.getHeight(), 1};
+            // Quad is already positioned at -2m in Z (in vertex data)
+            model = Matrix4x4::Identity();
         }
 
-        blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        blitRegion.dstSubresource.mipLevel = 0;
-        blitRegion.dstSubresource.baseArrayLayer = 0;
-        blitRegion.dstSubresource.layerCount = 1;
-        blitRegion.dstOffsets[0] = {0, 0, 0};
-        blitRegion.dstOffsets[1] = {(int32_t)width, (int32_t)height, 1};
+        // MVP = Projection * View * Model
+        Matrix4x4 vp = Matrix4x4::Multiply(projection, view);
+        Matrix4x4 mvp = Matrix4x4::Multiply(vp, model);
 
-        vkCmdBlitImage(cmdBuffer,
-            cudaInterop.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1, &blitRegion, VK_FILTER_LINEAR);
+        // Compute UV offset and scale for SBS mode
+        float uvOffset[2], uvScale[2];
+        if (sbsMode) {
+            // Side-by-side mode: each eye sees half the texture
+            uvScale[0] = 0.5f;  // Scale U to half
+            uvScale[1] = 1.0f;  // Keep V at full height
+            if (eyeIndex == 0) {
+                // Left eye: left half (U from 0.0 to 0.5)
+                uvOffset[0] = 0.0f;
+                uvOffset[1] = 0.0f;
+            } else {
+                // Right eye: right half (U from 0.5 to 1.0)
+                uvOffset[0] = 0.5f;
+                uvOffset[1] = 0.0f;
+            }
+        } else {
+            // Mono mode: use full texture for both eyes
+            uvScale[0] = 1.0f;
+            uvScale[1] = 1.0f;
+            uvOffset[0] = 0.0f;
+            uvOffset[1] = 0.0f;
+        }
 
-        // Transition source texture back to GENERAL for next CUDA use
-        srcBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        // Push constants: MVP matrix + UV offset + UV scale
+        struct PushConstants {
+            float mvp[16];
+            float uvOffset[2];
+            float uvScale[2];
+        } pushConstants;
+
+        memcpy(pushConstants.mvp, mvp.m, sizeof(mvp.m));
+        pushConstants.uvOffset[0] = uvOffset[0];
+        pushConstants.uvOffset[1] = uvOffset[1];
+        pushConstants.uvScale[0] = uvScale[0];
+        pushConstants.uvScale[1] = uvScale[1];
+
+        vkCmdPushConstants(cmdBuffer, vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+            0, sizeof(PushConstants), &pushConstants);
+
+        // Bind vertex and index buffers
+        VkBuffer vertexBuffers[] = {vkVertexBuffer};
+        VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(cmdBuffer, 0, 1, vertexBuffers, offsets);
+        vkCmdBindIndexBuffer(cmdBuffer, vkIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+        // Draw the quad
+        vkCmdDrawIndexed(cmdBuffer, indexCount, 1, 0, 0, 0);
+
+        // End render pass
+        vkCmdEndRenderPass(cmdBuffer);
+
+        // Transition video texture back to GENERAL for CUDA
+        srcBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         srcBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        srcBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        srcBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
         srcBarrier.dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
 
         vkCmdPipelineBarrier(cmdBuffer,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             0, 0, nullptr, 0, nullptr, 1, &srcBarrier);
     } else {
-        // Fallback: Clear with test pattern colors
-        VkClearColorValue clearColor;
+        // Fallback: Clear with test pattern colors using render pass
+        VkRenderPassBeginInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        renderPassInfo.renderPass = vkRenderPass;
+        renderPassInfo.framebuffer = vkFramebuffers[eyeIndex][imageIndex];
+        renderPassInfo.renderArea.offset = {0, 0};
+        renderPassInfo.renderArea.extent = {width, height};
+
+        VkClearValue clearValue{};
         if (eyeIndex == 0) {
             // Left eye: Cyan
-            clearColor.float32[0] = 0.0f;  // R
-            clearColor.float32[1] = 0.7f;  // G
-            clearColor.float32[2] = 1.0f;  // B
-            clearColor.float32[3] = 1.0f;  // A
+            clearValue.color = {{0.0f, 0.7f, 1.0f, 1.0f}};
         } else {
             // Right eye: Magenta
-            clearColor.float32[0] = 1.0f;  // R
-            clearColor.float32[1] = 0.0f;  // G
-            clearColor.float32[2] = 0.7f;  // B
-            clearColor.float32[3] = 1.0f;  // A
+            clearValue.color = {{1.0f, 0.0f, 0.7f, 1.0f}};
         }
+        renderPassInfo.clearValueCount = 1;
+        renderPassInfo.pClearValues = &clearValue;
 
-        VkImageSubresourceRange range{};
-        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        range.baseMipLevel = 0;
-        range.levelCount = 1;
-        range.baseArrayLayer = 0;
-        range.layerCount = 1;
-
-        vkCmdClearColorImage(cmdBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
+        vkCmdBeginRenderPass(cmdBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdEndRenderPass(cmdBuffer);
     }
-
-    // Transition destination image to COLOR_ATTACHMENT_OPTIMAL for presentation
-    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-    vkCmdPipelineBarrier(cmdBuffer,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
 
     // End command buffer
     vkEndCommandBuffer(cmdBuffer);
@@ -1258,7 +1876,7 @@ void SimpleVRPlayer::renderFrame() {
             // Render to the swapchain image
             auto renderEyeStart = std::chrono::steady_clock::now();  // NEW
             VkImage image = swapchainImages[i][imageIndex].image;
-            renderEye(i, image, viewConfigs[i].recommendedImageRectWidth, viewConfigs[i].recommendedImageRectHeight);
+            renderEye(i, imageIndex, image, viewConfigs[i].recommendedImageRectWidth, viewConfigs[i].recommendedImageRectHeight);
             auto renderEyeEnd = std::chrono::steady_clock::now();  // NEW
             renderEyeTime += std::chrono::duration<double, std::milli>(renderEyeEnd - renderEyeStart).count();  // NEW
 
@@ -1400,6 +2018,10 @@ bool SimpleVRPlayer::loadVideo(const char* filename) {
         return false;
     }
 
+    // Update descriptor set to bind the video texture
+    updateDescriptorSet();
+    std::cout << "Descriptor set updated with video texture" << std::endl;
+
     // Allocate frame buffer for NV12 frames (1.5 bytes per pixel)
     frameBuffer.resize(videoWidth * videoHeight * 3 / 2);  // NV12
 
@@ -1443,10 +2065,46 @@ void SimpleVRPlayer::run() {
 void SimpleVRPlayer::shutdown() {
     std::cout << "\nShutting down..." << std::endl;
 
+    // Wait for device to be idle before cleanup
+    if (vkDevice != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(vkDevice);
+    }
+
     // Cleanup CUDA interop (must be done before destroying Vulkan device)
     cudaInteropDestroy(&cudaInterop);
 
-    // Destroy rendering resources
+    // Destroy framebuffers and image views
+    for (auto& framebufferList : vkFramebuffers) {
+        for (auto framebuffer : framebufferList) {
+            if (framebuffer != VK_NULL_HANDLE) {
+                vkDestroyFramebuffer(vkDevice, framebuffer, nullptr);
+            }
+        }
+    }
+    for (auto& imageViewList : vkSwapchainImageViews) {
+        for (auto imageView : imageViewList) {
+            if (imageView != VK_NULL_HANDLE) {
+                vkDestroyImageView(vkDevice, imageView, nullptr);
+            }
+        }
+    }
+
+    // Destroy geometry buffers
+    if (vkVertexBuffer != VK_NULL_HANDLE) vkDestroyBuffer(vkDevice, vkVertexBuffer, nullptr);
+    if (vkVertexBufferMemory != VK_NULL_HANDLE) vkFreeMemory(vkDevice, vkVertexBufferMemory, nullptr);
+    if (vkIndexBuffer != VK_NULL_HANDLE) vkDestroyBuffer(vkDevice, vkIndexBuffer, nullptr);
+    if (vkIndexBufferMemory != VK_NULL_HANDLE) vkFreeMemory(vkDevice, vkIndexBufferMemory, nullptr);
+
+    // Destroy descriptor sets and pools
+    if (vkDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(vkDevice, vkDescriptorPool, nullptr);
+    if (vkDescriptorSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(vkDevice, vkDescriptorSetLayout, nullptr);
+
+    // Destroy pipeline and layout
+    if (vkGraphicsPipeline != VK_NULL_HANDLE) vkDestroyPipeline(vkDevice, vkGraphicsPipeline, nullptr);
+    if (vkPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(vkDevice, vkPipelineLayout, nullptr);
+    if (vkRenderPass != VK_NULL_HANDLE) vkDestroyRenderPass(vkDevice, vkRenderPass, nullptr);
+
+    // Destroy command pool
     if (vkCommandPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, vkCommandPool, nullptr);
 
     // Destroy swapchains
@@ -1470,13 +2128,14 @@ void SimpleVRPlayer::shutdown() {
 
 int main(int argc, char** argv) {
     std::cout << "=== Simple VR Player ===" << std::endl;
-    std::cout << "Phase 5: 3D Side-by-Side Video Support" << std::endl;
+    std::cout << "Phase 6: 180°/360° Sphere VR Video Support" << std::endl;
     std::cout << std::endl;
 
     // Parse command line arguments
     const char* videoFile = nullptr;
     bool sbsMode = false;
     bool debugMode = false;
+    SimpleVRPlayer::VideoMode videoMode = SimpleVRPlayer::MODE_FLAT;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--sbs") == 0 || strcmp(argv[i], "-s") == 0) {
@@ -1485,6 +2144,12 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-d") == 0) {
             debugMode = true;
             std::cout << "Debug/performance mode enabled" << std::endl;
+        } else if (strcmp(argv[i], "--180") == 0 || strcmp(argv[i], "-1") == 0) {
+            videoMode = SimpleVRPlayer::MODE_SPHERE_180;
+            std::cout << "180° sphere mode enabled" << std::endl;
+        } else if (strcmp(argv[i], "--360") == 0 || strcmp(argv[i], "-3") == 0) {
+            videoMode = SimpleVRPlayer::MODE_SPHERE_360;
+            std::cout << "360° sphere mode enabled" << std::endl;
         } else if (argv[i][0] != '-') {
             videoFile = argv[i];
         }
@@ -1508,6 +2173,9 @@ int main(int argc, char** argv) {
         player.setDebugMode(true);
     }
 
+    // Set video mode (flat/180°/360°)
+    player.setVideoMode(videoMode);
+
     // Load video file if provided
     if (videoFile) {
         if (!player.loadVideo(videoFile)) {
@@ -1515,9 +2183,12 @@ int main(int argc, char** argv) {
         }
     } else {
         std::cout << "No video file specified, showing test pattern" << std::endl;
-        std::cout << "Usage: ./simple-vr-player [--sbs] [--debug] <video_file.mp4>" << std::endl;
-        std::cout << "  --sbs, -s    Enable side-by-side 3D mode" << std::endl;
-        std::cout << "  --debug, -d  Enable performance metrics (FPS, timing)" << std::endl;
+        std::cout << "Usage: ./simple-vr-player [options] <video_file.mp4>" << std::endl;
+        std::cout << "Options:" << std::endl;
+        std::cout << "  --sbs, -s     Enable side-by-side 3D mode" << std::endl;
+        std::cout << "  --180, -1     Enable 180° sphere mode" << std::endl;
+        std::cout << "  --360, -3     Enable 360° sphere mode" << std::endl;
+        std::cout << "  --debug, -d   Enable performance metrics (FPS, timing)" << std::endl;
         std::cout << std::endl;
     }
 

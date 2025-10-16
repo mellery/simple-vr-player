@@ -19,6 +19,9 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+// CUDA interop
+#include "cuda_interop.h"
+
 // Helper macro for OpenXR error checking
 #define XR_CHECK(result, msg) \
     if (XR_FAILED(result)) { \
@@ -38,7 +41,7 @@ public:
     ~VideoDecoder() { close(); }
 
     bool open(const char* filename);
-    bool readFrame(uint8_t* rgbaBuffer, int* width, int* height);  // Now outputs RGBA
+    bool readFrame(uint8_t* nv12Buffer, int* width, int* height, size_t* nv12Size);  // Now outputs NV12
     void close();
 
     int getWidth() const { return codecCtx ? codecCtx->width : 0; }
@@ -177,7 +180,7 @@ bool VideoDecoder::open(const char* filename) {
     return true;
 }
 
-bool VideoDecoder::readFrame(uint8_t* rgbaBuffer, int* width, int* height) {
+bool VideoDecoder::readFrame(uint8_t* nv12Buffer, int* width, int* height, size_t* nv12Size) {
     while (av_read_frame(formatCtx, packet) >= 0) {
         if (packet->stream_index == videoStreamIndex) {
             // Send packet to decoder
@@ -200,8 +203,8 @@ bool VideoDecoder::readFrame(uint8_t* rgbaBuffer, int* width, int* height) {
             // If hardware decode, transfer frame from GPU to CPU
             AVFrame* sourceFrame = frame;
             if (useHardwareDecode && frame->format == AV_PIX_FMT_CUDA) {
-                // Transfer hardware frame to software frame
-                swFrame->format = AV_PIX_FMT_NV12;  // CUDA typically outputs NV12
+                // Transfer hardware frame to software frame (NV12 format)
+                swFrame->format = AV_PIX_FMT_NV12;
                 ret = av_hwframe_transfer_data(swFrame, frame, 0);
                 if (ret < 0) {
                     std::cerr << "ERROR: Failed to transfer frame from GPU to CPU" << std::endl;
@@ -209,29 +212,65 @@ bool VideoDecoder::readFrame(uint8_t* rgbaBuffer, int* width, int* height) {
                     return false;
                 }
                 sourceFrame = swFrame;
-            }
+            } else {
+                // Software decode - convert to NV12 if needed
+                if (sourceFrame->format != AV_PIX_FMT_NV12) {
+                    if (!swsCtx) {
+                        swsCtx = sws_getContext(
+                            codecCtx->width, codecCtx->height,
+                            (AVPixelFormat)sourceFrame->format,
+                            codecCtx->width, codecCtx->height, AV_PIX_FMT_NV12,
+                            SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    }
+                    if (swsCtx) {
+                        swFrame->format = AV_PIX_FMT_NV12;
+                        swFrame->width = codecCtx->width;
+                        swFrame->height = codecCtx->height;
+                        av_frame_get_buffer(swFrame, 0);
 
-            // Initialize swscale context if needed
-            if (!swsCtx) {
-                swsCtx = sws_getContext(
-                    codecCtx->width, codecCtx->height,
-                    (AVPixelFormat)sourceFrame->format,
-                    codecCtx->width, codecCtx->height, AV_PIX_FMT_RGBA,
-                    SWS_BILINEAR, nullptr, nullptr, nullptr);
-
-                if (!swsCtx) {
-                    std::cerr << "ERROR: Could not initialize swscale context" << std::endl;
-                    av_packet_unref(packet);
-                    return false;
+                        sws_scale(swsCtx, sourceFrame->data, sourceFrame->linesize, 0, codecCtx->height,
+                                 swFrame->data, swFrame->linesize);
+                        sourceFrame = swFrame;
+                    }
                 }
             }
 
-            // Convert frame to RGBA
-            uint8_t* dest[4] = { rgbaBuffer, nullptr, nullptr, nullptr };
-            int destLinesize[4] = { codecCtx->width * 4, 0, 0, 0 };
+            // Copy NV12 data (Y plane + UV plane) accounting for FFmpeg linesize/stride
+            int yPlaneSize = codecCtx->width * codecCtx->height;
+            int uvPlaneSize = yPlaneSize / 2;  // UV plane is half size
+            *nv12Size = yPlaneSize + uvPlaneSize;
 
-            sws_scale(swsCtx, sourceFrame->data, sourceFrame->linesize, 0, codecCtx->height,
-                     dest, destLinesize);
+            // Debug: Print linesize info on first frame
+            static bool firstFrame = true;
+            if (firstFrame) {
+                std::cout << "NV12 Debug Info:" << std::endl;
+                std::cout << "  Frame size: " << codecCtx->width << "x" << codecCtx->height << std::endl;
+                std::cout << "  Y linesize: " << sourceFrame->linesize[0] << " (expected: " << codecCtx->width << ")" << std::endl;
+                std::cout << "  UV linesize: " << sourceFrame->linesize[1] << " (expected: " << codecCtx->width << ")" << std::endl;
+                std::cout << "  Format: " << av_get_pix_fmt_name((AVPixelFormat)sourceFrame->format) << std::endl;
+                firstFrame = false;
+            }
+
+            // Copy Y plane row by row (accounting for stride/padding)
+            uint8_t* yDst = nv12Buffer;
+            const uint8_t* ySrc = sourceFrame->data[0];
+            int yStride = sourceFrame->linesize[0];
+            for (int row = 0; row < codecCtx->height; row++) {
+                memcpy(yDst, ySrc, codecCtx->width);
+                yDst += codecCtx->width;
+                ySrc += yStride;
+            }
+
+            // Copy UV plane row by row (accounting for stride/padding)
+            uint8_t* uvDst = nv12Buffer + yPlaneSize;
+            const uint8_t* uvSrc = sourceFrame->data[1];
+            int uvStride = sourceFrame->linesize[1];
+            int uvHeight = codecCtx->height / 2;
+            for (int row = 0; row < uvHeight; row++) {
+                memcpy(uvDst, uvSrc, codecCtx->width);  // UV width is same as Y width (interleaved U/V)
+                uvDst += codecCtx->width;
+                uvSrc += uvStride;
+            }
 
             *width = codecCtx->width;
             *height = codecCtx->height;
@@ -607,7 +646,7 @@ private:
 
     // Video playback resources
     VideoDecoder videoDecoder;
-    DynamicTexture videoTexture;
+    VulkanCudaInterop cudaInterop = {};
     std::vector<uint8_t> frameBuffer;
     bool videoLoaded = false;
     bool sbsMode = false;  // Side-by-side 3D mode
@@ -970,16 +1009,14 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, VkImage image, uint32_t width,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
     if (videoLoaded) {
-        // Wait for video texture upload to complete before using it
-        videoTexture.waitForUpload(vkDevice);
-
         // Transition source video texture to TRANSFER_SRC_OPTIMAL
+        // CUDA interop image is ready to use (conversion is synchronous)
         VkImageMemoryBarrier srcBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        srcBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        srcBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         srcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         srcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         srcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        srcBarrier.image = videoTexture.getImage();
+        srcBarrier.image = cudaInterop.image;
         srcBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         srcBarrier.subresourceRange.baseMipLevel = 0;
         srcBarrier.subresourceRange.levelCount = 1;
@@ -1030,19 +1067,19 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, VkImage image, uint32_t width,
         blitRegion.dstOffsets[1] = {(int32_t)width, (int32_t)height, 1};
 
         vkCmdBlitImage(cmdBuffer,
-            videoTexture.getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            cudaInterop.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             1, &blitRegion, VK_FILTER_LINEAR);
 
-        // Transition source texture back to SHADER_READ_ONLY
+        // Transition source texture back to GENERAL for next CUDA use
         srcBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        srcBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        srcBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         srcBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        srcBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        srcBarrier.dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
 
         vkCmdPipelineBarrier(cmdBuffer,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             0, 0, nullptr, 0, nullptr, 1, &srcBarrier);
     } else {
         // Fallback: Clear with test pattern colors
@@ -1176,20 +1213,21 @@ void SimpleVRPlayer::renderFrame() {
             auto decodeStart = std::chrono::steady_clock::now();
 
             int width, height;
-            if (videoDecoder.readFrame(frameBuffer.data(), &width, &height)) {
+            size_t nv12Size;
+            if (videoDecoder.readFrame(frameBuffer.data(), &width, &height, &nv12Size)) {
                 auto decodeEnd = std::chrono::steady_clock::now();
                 decodeTime = std::chrono::duration<double, std::milli>(decodeEnd - decodeStart).count();
 
-                // Upload new frame to GPU
+                // Convert NV12 to RGBA on GPU using CUDA
                 auto uploadStart = std::chrono::steady_clock::now();
-                videoTexture.update(vkDevice, vkQueue, frameBuffer.data(), width, height);
+                cudaConvertNV12ToRGBA(&cudaInterop, frameBuffer.data(), nv12Size);
                 auto uploadEnd = std::chrono::steady_clock::now();
                 uploadTime = std::chrono::duration<double, std::milli>(uploadEnd - uploadStart).count();
             } else {
-                // End of video - loop back to start (or could stop playback)
+                // End of video - loop back to start
                 std::cout << "End of video reached, looping..." << std::endl;
                 videoDecoder.close();
-                videoLoaded = false;  // Will show test pattern
+                videoLoaded = false;
             }
         }
 
@@ -1280,6 +1318,10 @@ void SimpleVRPlayer::renderFrame() {
             double avgRenderEye = frameCount > 0 ? totalRenderEyeTime / frameCount : 0.0;  // NEW
             double avgOpenXR = frameCount > 0 ? totalOpenXRTime / frameCount : 0.0;  // NEW
 
+            // Calculate accounted and unaccounted time
+            double accountedTime = avgDecode + avgUpload + avgRenderEye + avgOpenXR;
+            double unaccountedTime = avgFrame - accountedTime;
+
             // Print comprehensive timing breakdown
             std::cout << "[PERF] FPS: " << std::fixed << std::setprecision(1) << avgFPS
                       << " | Frame: " << std::setprecision(2) << avgFrame << "ms" << std::endl;
@@ -1287,13 +1329,21 @@ void SimpleVRPlayer::renderFrame() {
                       << " | Upload: " << avgUpload << "ms"
                       << " | RenderEye: " << avgRenderEye << "ms"
                       << " | OpenXR: " << avgOpenXR << "ms" << std::endl;
+            std::cout << "       Accounted: " << accountedTime << "ms"
+                      << " | UNACCOUNTED: " << unaccountedTime << "ms ("
+                      << std::setprecision(1) << (unaccountedTime / avgFrame * 100.0) << "%)" << std::endl;
 
             // Calculate and print detailed OpenXR breakdown (these are single-frame samples, not averages)
-            std::cout << "       [OpenXR] WaitFrame: " << waitFrameTime << "ms"
+            std::cout << "       [OpenXR] WaitFrame: " << std::setprecision(2) << waitFrameTime << "ms"
                       << " | BeginFrame: " << beginFrameTime << "ms"
                       << " | LocateViews: " << locateViewsTime << "ms" << std::endl;
             std::cout << "       [OpenXR] AcquireSwap: " << acquireSwapchainTime << "ms"
                       << " | EndFrame: " << endFrameTime << "ms" << std::endl;
+
+            // Print warning if xrWaitFrame is suspiciously long
+            if (waitFrameTime > 10.0) {
+                std::cout << "       ⚠️  WARNING: xrWaitFrame is " << waitFrameTime << "ms - likely vsync throttling!" << std::endl;
+            }
 
             // Reset counters
             lastFPSPrint = now;
@@ -1334,19 +1384,31 @@ bool SimpleVRPlayer::loadVideo(const char* filename) {
     int videoWidth = videoDecoder.getWidth();
     int videoHeight = videoDecoder.getHeight();
 
-    if (!videoTexture.create(vkDevice, vkPhysicalDevice, vkCommandPool, videoWidth, videoHeight)) {
-        std::cerr << "ERROR: Failed to create video texture" << std::endl;
+    // Initialize CUDA interop
+    if (!cudaInteropInit(&cudaInterop, vkDevice, vkPhysicalDevice)) {
+        std::cerr << "ERROR: Failed to initialize CUDA interop" << std::endl;
         return false;
     }
 
-    // Allocate frame buffer for decoded frames
-    frameBuffer.resize(videoWidth * videoHeight * 4);  // RGBA32
+    if (!cudaInteropCreateImage(&cudaInterop, videoWidth, videoHeight)) {
+        std::cerr << "ERROR: Failed to create interop image" << std::endl;
+        return false;
+    }
 
-    // Decode and upload first frame
+    if (!cudaInteropImportMemory(&cudaInterop)) {
+        std::cerr << "ERROR: Failed to import Vulkan memory into CUDA" << std::endl;
+        return false;
+    }
+
+    // Allocate frame buffer for NV12 frames (1.5 bytes per pixel)
+    frameBuffer.resize(videoWidth * videoHeight * 3 / 2);  // NV12
+
+    // Decode and convert first frame
     int width, height;
-    if (videoDecoder.readFrame(frameBuffer.data(), &width, &height)) {
-        videoTexture.update(vkDevice, vkQueue, frameBuffer.data(), width, height);
-        std::cout << "First frame loaded and uploaded to GPU" << std::endl;
+    size_t nv12Size;
+    if (videoDecoder.readFrame(frameBuffer.data(), &width, &height, &nv12Size)) {
+        cudaConvertNV12ToRGBA(&cudaInterop, frameBuffer.data(), nv12Size);
+        std::cout << "First frame loaded and converted via CUDA" << std::endl;
     } else {
         std::cerr << "ERROR: Failed to decode first frame" << std::endl;
         return false;
@@ -1380,6 +1442,9 @@ void SimpleVRPlayer::run() {
 
 void SimpleVRPlayer::shutdown() {
     std::cout << "\nShutting down..." << std::endl;
+
+    // Cleanup CUDA interop (must be done before destroying Vulkan device)
+    cudaInteropDestroy(&cudaInterop);
 
     // Destroy rendering resources
     if (vkCommandPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, vkCommandPool, nullptr);

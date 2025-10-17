@@ -16,5 +16,7 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     gl_Position = pc.mvp * vec4(inPosition, 1.0);
+
+    // Apply UV transformation for SBS mode
     fragTexCoord = inTexCoord * pc.uvScale + pc.uvOffset;
 }

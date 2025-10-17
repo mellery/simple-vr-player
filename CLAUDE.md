@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Simple VR Player is an OpenXR-based VR video player for Linux with PSVR2 support. It uses Vulkan for rendering and FFmpeg for video decoding, with hardware acceleration support (NVDEC). The application runs on the Monado OpenXR runtime and displays video content in virtual reality.
 
-**Current Status:** Phase 6 complete - CUDA-Vulkan interop with 60 FPS performance achieved
+**Current Status:** Phase 6+ complete - 3D rendering pipeline with proper SBS stereoscopic depth perception
 
 ## Build System
 
@@ -49,9 +49,12 @@ cd /home/mike/src/simple-vr-player/build
 ### Core Components
 
 The application consists of:
-- **src/main.cpp**: Main application (~1465 lines) - OpenXR/Vulkan setup and rendering loop
+- **src/main.cpp**: Main application (~2000 lines) - OpenXR/Vulkan setup, 3D rendering pipeline, and frame loop
 - **src/cuda_interop.cu**: CUDA-Vulkan interop implementation with NV12→RGBA conversion kernel
 - **src/cuda_interop.h**: Interop interface and data structures
+- **src/math_utils.h**: Matrix math utilities for 3D transformations (projection, view matrices)
+- **shaders/quad.vert**: Vertex shader for textured quad with MVP transformation and UV mapping
+- **shaders/quad.frag**: Fragment shader for texture sampling
 
 This architecture separates concerns while maintaining simplicity.
 
@@ -76,18 +79,36 @@ This architecture separates concerns while maintaining simplicity.
 - Implements frame loop with video decode → CUDA convert → render cycle
 - Supports both monoscopic and side-by-side stereoscopic video
 
-### Rendering Pipeline
+### Rendering Pipeline (3D Graphics Pipeline)
 
-The renderEye() method implements a simple blit-based approach:
+The renderEye() method (lines 1433-1577) implements proper 3D rendering:
 1. Allocates command buffer (per-frame, potential optimization)
-2. Transitions swapchain image to TRANSFER_DST_OPTIMAL
-3. Blits CUDA-converted RGBA texture to swapchain image (scales automatically)
-   - In SBS mode: splits source texture horizontally per eye
-   - In mono mode: uses full texture for both eyes
-4. Transitions swapchain image to COLOR_ATTACHMENT_OPTIMAL
-5. Submits and waits for completion
+2. Transitions video texture to SHADER_READ_ONLY_OPTIMAL
+3. Begins render pass with framebuffer
+4. Binds graphics pipeline (vertex/fragment shaders)
+5. Binds descriptor set (video texture sampler)
+6. Sets viewport and scissor
+7. Computes MVP matrix from OpenXR view/projection matrices
+8. Computes UV offset/scale for SBS mode:
+   - **Mono mode:** UV scale (1.0, 1.0), offset (0.0, 0.0) - full texture
+   - **SBS mode:** UV scale (0.5, 1.0), offset varies by eye:
+     * Left eye: offset (0.0, 0.0) - samples left half of texture
+     * Right eye: offset (0.5, 0.0) - samples right half of texture
+9. Pushes constants (MVP matrix + UV offset/scale)
+10. Binds vertex and index buffers
+11. Draws indexed quad (6 indices, 2 triangles)
+12. Ends render pass
+13. Transitions video texture back to GENERAL for CUDA
+14. Submits and waits for completion
 
-**Note:** Uses synchronous vkQueueWaitIdle() for simplicity. Render time is only 0.5ms so not a bottleneck.
+**Key Feature:** Proper 3D rendering with OpenXR view matrices creates parallax between eyes, enabling genuine stereoscopic depth perception in SBS mode.
+
+**Quad Geometry:**
+- Positioned 2 meters in front of viewer (-2m in Z)
+- 2×2 meters size (adjustable via vertex data)
+- Textured with video content
+
+**Note:** Uses synchronous vkQueueWaitIdle() for simplicity. Render time is ~1-2ms so not a bottleneck.
 
 ### Video Decoding Flow (CUDA-Vulkan Interop)
 
@@ -170,7 +191,13 @@ Edit cuda_interop.cu for GPU-side processing:
 
 ### Changing Rendering
 
-Edit renderEye() (lines 937-1098) for per-eye rendering logic. For SBS mode, see the blit region calculation at lines 1003-1023.
+Edit renderEye() (lines 1433-1577) for per-eye rendering logic. The function uses:
+- Graphics pipeline with vertex/fragment shaders
+- MVP matrix computed from OpenXR view/projection matrices
+- UV offset/scale push constants for SBS mode texture mapping
+- Framebuffers for render pass execution
+
+To adjust quad position or size, edit createQuadGeometry() (lines 1268-1340).
 
 ### Performance Instrumentation
 
@@ -186,7 +213,7 @@ double ms = std::chrono::duration<double, std::milli>(end - start).count();
 
 ### Current Limitations
 
-1. **No shader-based rendering**: Uses Vulkan blit operations instead of textured quads
+1. **Fixed quad position/size**: Screen is fixed 2m away, 2×2 meters (not yet user-configurable)
 2. **No audio support**: Video-only playback
 3. **No seeking/playback controls**: Videos play once then loop
 4. **No 360°/180° sphere projection**: Only flat-screen rendering
@@ -208,6 +235,7 @@ See `performance.md` for detailed analysis. Remaining improvements:
 - ✅ Vulkan-CUDA interop (62% video pipeline improvement)
 - ✅ Hardware decode (NVDEC)
 - ✅ GPU-accelerated NV12→RGBA conversion
+- ✅ 3D graphics pipeline for proper SBS stereoscopic rendering
 
 ### Future Features
 
@@ -262,6 +290,8 @@ Enable performance monitoring:
 
 ## Related Documentation
 
+- `INTEGRATION_STATUS.md`: Complete technical summary of 3D rendering implementation
+- `TESTING_GUIDE.md`: Step-by-step testing instructions for all modes
 - `roadmap.md`: Complete development roadmap with implementation phases and performance status
 - `performance.md`: Detailed performance analysis, benchmark results, and optimization recommendations
 

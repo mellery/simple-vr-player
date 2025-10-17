@@ -70,8 +70,11 @@ bool VideoDecoder::open(const char* filename) {
     std::cout << "Opening video file: " << filename << std::endl;
 
     // Open video file
-    if (avformat_open_input(&formatCtx, filename, nullptr, nullptr) < 0) {
-        std::cerr << "ERROR: Could not open video file" << std::endl;
+    int ret = avformat_open_input(&formatCtx, filename, nullptr, nullptr);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        std::cerr << "ERROR: Could not open video file: " << errbuf << std::endl;
         return false;
     }
 
@@ -715,6 +718,7 @@ private:
     void updateDescriptorSet();  // Update descriptor to point to video texture
     bool createQuadGeometry();
     bool createSphereGeometry(int segments, float radius, float angleHorizontal, float angleVertical);
+    bool createSphereGeometryPerEye(int eyeIndex, int segments, float radius, float angleHorizontal, float angleVertical);
     bool createFramebuffers();
     uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
 
@@ -1000,6 +1004,12 @@ bool SimpleVRPlayer::createSwapchains() {
             (int32_t)viewConfigs[i].recommendedImageRectWidth,
             (int32_t)viewConfigs[i].recommendedImageRectHeight
         };
+        std::cout << "DEBUG: Eye " << i << " projectionView:" << std::endl;
+        std::cout << "  swapchain=" << projectionViews[i].subImage.swapchain << std::endl;
+        std::cout << "  imageRect offset=(" << projectionViews[i].subImage.imageRect.offset.x << ", "
+                  << projectionViews[i].subImage.imageRect.offset.y << ")" << std::endl;
+        std::cout << "  imageRect extent=(" << projectionViews[i].subImage.imageRect.extent.width << ", "
+                  << projectionViews[i].subImage.imageRect.extent.height << ")" << std::endl;
     }
 
     std::cout << "Swapchains created successfully" << std::endl;
@@ -1182,8 +1192,8 @@ bool SimpleVRPlayer::createGraphicsPipeline() {
     rasterizer.rasterizerDiscardEnable = VK_FALSE;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;  // Disable culling for debugging
+    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
 
     // Multisampling
@@ -1282,10 +1292,10 @@ bool SimpleVRPlayer::createQuadGeometry() {
     // Position the quad 2 meters in front of the viewer, 2 meters wide and tall
     float quadVertices[] = {
         // Positions (X, Y, Z)     // UVs (U, V)
-        -1.0f, -1.0f, -2.0f,       0.0f, 1.0f,  // Bottom-left
-         1.0f, -1.0f, -2.0f,       1.0f, 1.0f,  // Bottom-right
-         1.0f,  1.0f, -2.0f,       1.0f, 0.0f,  // Top-right
-        -1.0f,  1.0f, -2.0f,       0.0f, 0.0f   // Top-left
+        -1.0f, -1.0f, -2.0f,       0.0f, 0.0f,  // Bottom-left (flipped V)
+         1.0f, -1.0f, -2.0f,       1.0f, 0.0f,  // Bottom-right (flipped V)
+         1.0f,  1.0f, -2.0f,       1.0f, 1.0f,  // Top-right (flipped V)
+        -1.0f,  1.0f, -2.0f,       0.0f, 1.0f   // Top-left (flipped V)
     };
 
     uint16_t quadIndices[] = {
@@ -1362,18 +1372,21 @@ bool SimpleVRPlayer::createSphereGeometry(int segments, float radius, float angl
         float cosTheta = cos(theta);
 
         for (int lon = 0; lon <= segments; lon++) {
-            float phi = (float)lon / segments * angleHorizontal;
+            // Center the horizontal span around the front (-Z axis)
+            // For 180°, phi goes from -π/2 to +π/2 (centered at 0, facing -Z)
+            float phi = ((float)lon / segments - 0.5f) * angleHorizontal;
             float sinPhi = sin(phi);
             float cosPhi = cos(phi);
 
             // Position (X, Y, Z)
-            float x = radius * sinTheta * cosPhi;
-            float y = radius * cosTheta;
-            float z = radius * sinTheta * sinPhi;
+            // Standard sphere coordinates with viewer at origin facing -Z
+            float x = radius * sinTheta * sinPhi;  // Left-Right
+            float y = radius * cosTheta;            // Up-Down
+            float z = -radius * sinTheta * cosPhi; // Front-Back (negative = in front)
 
-            // UV coordinates
+            // UV coordinates (flip V vertically)
             float u = (float)lon / segments;
-            float v = (float)lat / segments;
+            float v = 1.0f - (float)lat / segments;  // Flip vertically
 
             vertices.push_back(x);
             vertices.push_back(y);
@@ -1383,23 +1396,46 @@ bool SimpleVRPlayer::createSphereGeometry(int segments, float radius, float angl
         }
     }
 
-    // Generate sphere indices
+    // Generate sphere indices (clockwise winding for inward-facing triangles)
     for (int lat = 0; lat < segments; lat++) {
         for (int lon = 0; lon < segments; lon++) {
             int first = lat * (segments + 1) + lon;
             int second = first + segments + 1;
 
+            // Clockwise winding when viewed from inside (matches VK_FRONT_FACE_CLOCKWISE)
             indices.push_back(first);
             indices.push_back(second);
             indices.push_back(first + 1);
 
+            indices.push_back(first + 1);
             indices.push_back(second);
             indices.push_back(second + 1);
-            indices.push_back(first + 1);
         }
     }
 
     indexCount = indices.size();
+
+    std::cout << "Sphere created: " << vertices.size()/5 << " vertices, "
+              << indexCount << " indices" << std::endl;
+
+    // DEBUG: Print some sample vertex positions to verify sphere geometry
+    std::cout << "DEBUG: Sample sphere vertices (first row - top pole):" << std::endl;
+    for (int i = 0; i < std::min(5, (int)(vertices.size() / 5)); i++) {
+        int idx = i * 5;
+        std::cout << "  Vertex " << i << ": pos=(" << vertices[idx] << ", " << vertices[idx+1] << ", " << vertices[idx+2]
+                  << ") uv=(" << vertices[idx+3] << ", " << vertices[idx+4] << ")" << std::endl;
+    }
+
+    // Print middle row (should show actual hemisphere curvature)
+    int segmentsPerRow = 65; // segments + 1
+    int middleRow = 32; // Middle of 64 segments
+    std::cout << "DEBUG: Sample sphere vertices (middle row - equator):" << std::endl;
+    for (int i = 0; i < std::min(5, segmentsPerRow); i++) {
+        int vertexIndex = middleRow * segmentsPerRow + i;
+        int idx = vertexIndex * 5;
+        std::cout << "  Vertex " << vertexIndex << ": pos=(" << vertices[idx] << ", " << vertices[idx+1] << ", " << vertices[idx+2]
+                  << ") uv=(" << vertices[idx+3] << ", " << vertices[idx+4] << ")" << std::endl;
+    }
 
     // Create vertex buffer
     VkDeviceSize vertexBufferSize = vertices.size() * sizeof(float);
@@ -1546,13 +1582,16 @@ bool SimpleVRPlayer::createRenderingResources() {
 
     // Create geometry based on video mode
     if (videoMode == MODE_FLAT) {
+        std::cout << "Creating FLAT quad geometry..." << std::endl;
         if (!createQuadGeometry()) return false;
     } else if (videoMode == MODE_SPHERE_180) {
-        // 180° hemisphere: 64 segments, 10m radius, 180° horizontal, 180° vertical
-        if (!createSphereGeometry(64, 10.0f, M_PI, M_PI)) return false;
+        std::cout << "Creating 180° SPHERE geometry..." << std::endl;
+        // 180° hemisphere: 64 segments, 1.5m radius for proper stereo separation, 180° horizontal, 180° vertical
+        if (!createSphereGeometry(64, 1.5f, M_PI, M_PI)) return false;
     } else if (videoMode == MODE_SPHERE_360) {
-        // 360° full sphere: 64 segments, 10m radius, 360° horizontal, 180° vertical
-        if (!createSphereGeometry(64, 10.0f, 2.0f * M_PI, M_PI)) return false;
+        std::cout << "Creating 360° SPHERE geometry..." << std::endl;
+        // 360° full sphere: 64 segments, 3m radius (very close for maximum immersion), 360° horizontal, 180° vertical
+        if (!createSphereGeometry(64, 3.0f, 2.0f * M_PI, M_PI)) return false;
     }
 
     if (!createFramebuffers()) return false;
@@ -1577,6 +1616,17 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, uint32_t imageIndex, VkImage i
     vkBeginCommandBuffer(cmdBuffer, &beginInfo);
 
     if (videoLoaded) {
+        // DEBUG: Confirm we're rendering video
+        static bool printed = false;
+        if (!printed) {
+            std::cout << "DEBUG: Rendering video texture (videoLoaded=true)" << std::endl;
+            std::cout << "DEBUG: cudaInterop.image = " << cudaInterop.image << std::endl;
+            std::cout << "DEBUG: cudaInterop.imageView = " << cudaInterop.imageView << std::endl;
+            std::cout << "DEBUG: cudaInterop.sampler = " << cudaInterop.sampler << std::endl;
+            std::cout << "DEBUG: vkDescriptorSet = " << vkDescriptorSet << std::endl;
+            printed = true;
+        }
+
         // Transition video texture to SHADER_READ_ONLY_OPTIMAL
         VkImageMemoryBarrier srcBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         srcBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1605,7 +1655,7 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, uint32_t imageIndex, VkImage i
         renderPassInfo.renderArea.extent = {width, height};
 
         VkClearValue clearValue{};
-        clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};  // BLACK background
         renderPassInfo.clearValueCount = 1;
         renderPassInfo.pClearValues = &clearValue;
 
@@ -1639,19 +1689,34 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, uint32_t imageIndex, VkImage i
         Matrix4x4 view = Matrix4x4::CreateViewMatrix(views[eyeIndex].pose);
         Matrix4x4 model = Matrix4x4::Identity();
 
-        // For sphere mode, sphere is centered at viewer position (origin in view space)
-        // The view matrix already handles the head rotation, no translation needed
-        if (videoMode == MODE_SPHERE_180 || videoMode == MODE_SPHERE_360) {
-            // Sphere is centered at origin - no model transformation needed
-            model = Matrix4x4::Identity();
-        } else {
-            // Quad is already positioned at -2m in Z (in vertex data)
-            model = Matrix4x4::Identity();
+        // DEBUG: Print view pose every 60 frames to see if tracking works
+        static int frameCount = 0;
+        if (eyeIndex == 0) frameCount++;
+        if (frameCount % 60 == 0 && eyeIndex == 0) {
+            std::cout << "Frame " << frameCount << " Eye " << eyeIndex << " pose: pos=("
+                      << views[eyeIndex].pose.position.x << ", "
+                      << views[eyeIndex].pose.position.y << ", "
+                      << views[eyeIndex].pose.position.z << "), orient=("
+                      << views[eyeIndex].pose.orientation.x << ", "
+                      << views[eyeIndex].pose.orientation.y << ", "
+                      << views[eyeIndex].pose.orientation.z << ", "
+                      << views[eyeIndex].pose.orientation.w << ")" << std::endl;
         }
 
         // MVP = Projection * View * Model
         Matrix4x4 vp = Matrix4x4::Multiply(projection, view);
         Matrix4x4 mvp = Matrix4x4::Multiply(vp, model);
+
+        // DEBUG: Print MVP matrix for first frame
+        static bool printedMVP = false;
+        if (!printedMVP && eyeIndex == 0) {
+            std::cout << "DEBUG MVP matrix eye 0:" << std::endl;
+            std::cout << "  Projection[0-3]: " << projection.m[0] << ", " << projection.m[1] << ", " << projection.m[2] << ", " << projection.m[3] << std::endl;
+            std::cout << "  View[0-3]: " << view.m[0] << ", " << view.m[1] << ", " << view.m[2] << ", " << view.m[3] << std::endl;
+            std::cout << "  Model[0-3]: " << model.m[0] << ", " << model.m[1] << ", " << model.m[2] << ", " << model.m[3] << std::endl;
+            std::cout << "  MVP[0-3]: " << mvp.m[0] << ", " << mvp.m[1] << ", " << mvp.m[2] << ", " << mvp.m[3] << std::endl;
+            printedMVP = true;
+        }
 
         // Compute UV offset and scale for SBS mode
         float uvOffset[2], uvScale[2];
@@ -1668,6 +1733,13 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, uint32_t imageIndex, VkImage i
                 uvOffset[0] = 0.5f;
                 uvOffset[1] = 0.0f;
             }
+
+            static bool printedSBS = false;
+            if (!printedSBS) {
+                std::cout << "DEBUG SBS: Eye " << eyeIndex << " uvOffset=(" << uvOffset[0] << ", " << uvOffset[1]
+                          << ") uvScale=(" << uvScale[0] << ", " << uvScale[1] << ")" << std::endl;
+                if (eyeIndex == 1) printedSBS = true;
+            }
         } else {
             // Mono mode: use full texture for both eyes
             uvScale[0] = 1.0f;
@@ -1677,17 +1749,37 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, uint32_t imageIndex, VkImage i
         }
 
         // Push constants: MVP matrix + UV offset + UV scale
+        // NOTE: Explicit padding to ensure correct alignment
         struct PushConstants {
-            float mvp[16];
-            float uvOffset[2];
-            float uvScale[2];
-        } pushConstants;
+            float mvp[16];       // 64 bytes (0-63)
+            float uvOffset[2];   // 8 bytes (64-71)
+            float uvScale[2];    // 8 bytes (72-79)
+        } __attribute__((packed)) pushConstants;
+
+        // DEBUG: Print struct size and member offsets
+        static bool printedLayout = false;
+        if (!printedLayout) {
+            std::cout << "DEBUG LAYOUT: sizeof(PushConstants) = " << sizeof(PushConstants) << std::endl;
+            std::cout << "  offsetof(mvp) = " << offsetof(PushConstants, mvp) << std::endl;
+            std::cout << "  offsetof(uvOffset) = " << offsetof(PushConstants, uvOffset) << std::endl;
+            std::cout << "  offsetof(uvScale) = " << offsetof(PushConstants, uvScale) << std::endl;
+            printedLayout = true;
+        }
 
         memcpy(pushConstants.mvp, mvp.m, sizeof(mvp.m));
         pushConstants.uvOffset[0] = uvOffset[0];
         pushConstants.uvOffset[1] = uvOffset[1];
         pushConstants.uvScale[0] = uvScale[0];
         pushConstants.uvScale[1] = uvScale[1];
+
+        // DEBUG: Print actual push constant values - ALWAYS print first few frames
+        static int debugFrameCount = 0;
+        if (debugFrameCount < 4) {
+            std::cout << "DEBUG PUSH FRAME " << debugFrameCount << ": Eye " << eyeIndex
+                      << " uvOffset=(" << pushConstants.uvOffset[0] << ", " << pushConstants.uvOffset[1]
+                      << ") uvScale=(" << pushConstants.uvScale[0] << ", " << pushConstants.uvScale[1] << ")" << std::endl;
+            if (eyeIndex == 1) debugFrameCount++;
+        }
 
         vkCmdPushConstants(cmdBuffer, vkPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
             0, sizeof(PushConstants), &pushConstants);
@@ -1698,7 +1790,22 @@ void SimpleVRPlayer::renderEye(uint32_t eyeIndex, uint32_t imageIndex, VkImage i
         vkCmdBindVertexBuffers(cmdBuffer, 0, 1, vertexBuffers, offsets);
         vkCmdBindIndexBuffer(cmdBuffer, vkIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
 
-        // Draw the quad
+        // DEBUG: Confirm we're drawing and which framebuffer
+        static bool drawPrinted = false;
+        if (!drawPrinted) {
+            std::cout << "DEBUG: Drawing with indexCount=" << indexCount;
+            if (indexCount == 6) {
+                std::cout << " (QUAD geometry)" << std::endl;
+            } else {
+                std::cout << " (SPHERE geometry)" << std::endl;
+            }
+            std::cout << "DEBUG: Eye " << eyeIndex << " rendering to framebuffer "
+                      << vkFramebuffers[eyeIndex][imageIndex]
+                      << " (image " << imageIndex << ")" << std::endl;
+            if (eyeIndex == 1) drawPrinted = true;
+        }
+
+        // Draw the geometry
         vkCmdDrawIndexed(cmdBuffer, indexCount, 1, 0, 0, 0);
 
         // End render pass
@@ -1876,6 +1983,14 @@ void SimpleVRPlayer::renderFrame() {
             // Render to the swapchain image
             auto renderEyeStart = std::chrono::steady_clock::now();  // NEW
             VkImage image = swapchainImages[i][imageIndex].image;
+
+            // DEBUG: Print VkImage pointers to verify they're different
+            static bool printedImages = false;
+            if (!printedImages) {
+                std::cout << "DEBUG RENDER: Eye " << i << " rendering to VkImage " << image << std::endl;
+                if (i == 1) printedImages = true;
+            }
+
             renderEye(i, imageIndex, image, viewConfigs[i].recommendedImageRectWidth, viewConfigs[i].recommendedImageRectHeight);
             auto renderEyeEnd = std::chrono::steady_clock::now();  // NEW
             renderEyeTime += std::chrono::duration<double, std::milli>(renderEyeEnd - renderEyeStart).count();  // NEW
@@ -2031,6 +2146,50 @@ bool SimpleVRPlayer::loadVideo(const char* filename) {
     if (videoDecoder.readFrame(frameBuffer.data(), &width, &height, &nv12Size)) {
         cudaConvertNV12ToRGBA(&cudaInterop, frameBuffer.data(), nv12Size);
         std::cout << "First frame loaded and converted via CUDA" << std::endl;
+
+        // Transition image from UNDEFINED to GENERAL layout for CUDA/Vulkan interop
+        VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocInfo.commandPool = vkCommandPool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer cmdBuffer;
+        vkAllocateCommandBuffers(vkDevice, &allocInfo, &cmdBuffer);
+
+        VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = cudaInterop.image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+
+        vkCmdPipelineBarrier(cmdBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        vkEndCommandBuffer(cmdBuffer);
+
+        VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &cmdBuffer;
+
+        vkQueueSubmit(vkQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(vkQueue);
+
+        vkFreeCommandBuffers(vkDevice, vkCommandPool, 1, &cmdBuffer);
+        std::cout << "Image transitioned to GENERAL layout" << std::endl;
     } else {
         std::cerr << "ERROR: Failed to decode first frame" << std::endl;
         return false;
@@ -2157,24 +2316,20 @@ int main(int argc, char** argv) {
 
     SimpleVRPlayer player;
 
-    // Initialize VR system
+    // Set modes BEFORE initializing (geometry creation depends on video mode)
+    if (sbsMode) {
+        player.setSBSMode(true);
+    }
+    if (debugMode) {
+        player.setDebugMode(true);
+    }
+    player.setVideoMode(videoMode);
+
+    // Initialize VR system (this creates geometry based on videoMode)
     if (!player.initialize()) {
         std::cerr << "Failed to initialize VR player" << std::endl;
         return 1;
     }
-
-    // Set SBS mode if enabled
-    if (sbsMode) {
-        player.setSBSMode(true);
-    }
-
-    // Set debug mode if enabled
-    if (debugMode) {
-        player.setDebugMode(true);
-    }
-
-    // Set video mode (flat/180°/360°)
-    player.setVideoMode(videoMode);
 
     // Load video file if provided
     if (videoFile) {

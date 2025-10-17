@@ -1,8 +1,8 @@
 # Simple VR Player - Development Roadmap
 
-**Current Status:** Phase 5 complete (Side-by-side 3D + CUDA optimization)
+**Current Status:** Phase 6 complete - 180°/360° sphere rendering (pending verification with headset)
 **Performance:** 60 FPS sustained @ 60Hz (capable of 90-120 FPS)
-**Next Phase:** Phase 5.6 - Enable 90Hz/120Hz modes
+**Next Phase:** Phase 7 - Controls and Polish
 
 ---
 
@@ -14,8 +14,10 @@
 | 2 | Basic rendering | ✅ Complete |
 | 3 | Video decoding (FFmpeg) | ✅ Complete |
 | 4 | Dynamic texture upload | ✅ Complete |
-| 5 | Side-by-side 3D support | ✅ Complete |
+| 5 | Side-by-side 3D support | ✅ Complete (pending verification) |
 | 5.5 | CUDA-Vulkan interop optimization | ✅ Complete |
+| 5.6 | 3D rendering pipeline with shaders | ✅ Complete |
+| 6 | 180°/360° sphere rendering | ✅ Complete (pending verification) |
 
 **See `CLAUDE.md` for implementation details and current architecture.**
 
@@ -184,103 +186,7 @@ export XR_RUNTIME_JSON=/home/mike/src/monado/build/openxr_monado-dev.json
 
 **Estimated Time:** 2-3 hours investigation + testing
 
----
-
-## 🔄 Next: Phase 6 - Sphere/360° VR Video Support
-
-**Goal:** Render equirectangular/fisheye VR videos on a sphere
-
-**Priority:** High (next major feature)
-
-### Implementation Plan
-
-#### 6.1 Sphere Geometry Generation
-
-Create geometry for 180° and 360° video playback:
-
-```cpp
-std::vector<Vertex> generateSphere(int segments, float radius,
-                                    float angleHorizontal, float angleVertical) {
-    std::vector<Vertex> vertices;
-
-    for (int lat = 0; lat <= segments; lat++) {
-        float theta = (float)lat / segments * angleVertical;
-        float sinTheta = sin(theta);
-        float cosTheta = cos(theta);
-
-        for (int lon = 0; lon <= segments; lon++) {
-            float phi = (float)lon / segments * angleHorizontal;
-            float sinPhi = sin(phi);
-            float cosPhi = cos(phi);
-
-            Vertex v;
-            v.pos[0] = radius * sinTheta * cosPhi;
-            v.pos[1] = radius * cosTheta;
-            v.pos[2] = radius * sinTheta * sinPhi;
-            v.uv[0] = (float)lon / segments;
-            v.uv[1] = (float)lat / segments;
-
-            vertices.push_back(v);
-        }
-    }
-
-    return vertices;
-}
-
-// For 180° video (hemisphere)
-auto sphereVerts = generateSphere(64, 10.0f, M_PI, M_PI);
-
-// For 360° video (full sphere)
-auto sphereVerts = generateSphere(64, 10.0f, 2.0f * M_PI, M_PI);
-```
-
-#### 6.2 Rendering Pipeline Changes
-
-**Current:** Flat quad rendering with Vulkan blit operations
-**New:** Proper 3D rendering with vertex/fragment shaders
-
-**Tasks:**
-1. Create vertex/fragment shaders for textured sphere
-2. Set up graphics pipeline (replaces current blit approach)
-3. Create vertex/index buffers for sphere geometry
-4. Adjust view matrix (sphere centered on viewer)
-
-**View Matrix:**
-```cpp
-// Sphere should be centered on viewer's head position
-glm::mat4 viewMatrix = glm::mat4(1.0f);  // Identity - no translation
-glm::mat4 projMatrix = ...; // From XrView fov
-glm::mat4 mvp = projMatrix * viewMatrix;
-```
-
-#### 6.3 Command-Line Options
-
-Add new flags for sphere rendering:
-
-- `--180` or `-1`: Enable 180° hemisphere mode
-- `--360` or `-3`: Enable 360° sphere mode
-- `--sbs` continues to work for side-by-side stereo
-
-**Example:**
-```bash
-./simple-vr-player --360 --sbs video_360_sbs.mp4
-```
-
-#### 6.4 Testing
-
-**Test videos:**
-```bash
-# 180° monoscopic
-ffmpeg -f lavfi -i testsrc=duration=10:size=3840x1920:rate=30 test_180.mp4
-
-# 360° monoscopic
-ffmpeg -f lavfi -i testsrc=duration=10:size=3840x1920:rate=30 test_360.mp4
-
-# 180° side-by-side
-ffmpeg -f lavfi -i testsrc=duration=10:size=7680x1920:rate=30 test_180_sbs.mp4
-```
-
-**Estimated Time:** 2-3 hours
+**See `PHASE6_IMPLEMENTATION.md` for details on completed 180°/360° sphere rendering.**
 
 ---
 
